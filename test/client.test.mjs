@@ -55,7 +55,7 @@ function load(extraModules = {}) {
 function introspect() {
   const probe = SOURCE.replace(
     "return { apply, inject: ['slots'], name: 'companion-client' }",
-    "return { apply, inject: ['slots'], name: 'companion-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar, CompanionPicker } }",
+    "return { apply, inject: ['slots'], name: 'companion-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar, CompanionPicker, AgentList, ConfirmDialog } }",
   )
   assert.notEqual(probe, SOURCE, '未能在 client.js 里定位 return 语句，测试探针需要同步更新')
   let registration = null
@@ -127,6 +127,12 @@ function makeStatefulReact() {
     useCallback: (fn) => {
       const i = cursor++
       if (!(i in slots)) slots[i] = fn
+      return slots[i]
+    },
+    // 最小 useRef：槽位存 {current}，重渲染返回同一对象（对齐真实 React 语义）。
+    useRef: (init) => {
+      const i = cursor++
+      if (!(i in slots)) slots[i] = { current: init }
       return slots[i]
     },
     Fragment: Symbol('Fragment'),
@@ -209,7 +215,7 @@ function mountParams({ initial = {}, failPut = false } = {}) {
 function introspectWith(ReactImpl, windowStub = {}) {
   const probe = SOURCE.replace(
     "return { apply, inject: ['slots'], name: 'companion-client' }",
-    "return { apply, inject: ['slots'], name: 'companion-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar, CompanionPicker } }",
+    "return { apply, inject: ['slots'], name: 'companion-client', __test: { Dialog, CSS, ParamsTab, AgentDetail, TabBar, CompanionPicker, AgentList, ConfirmDialog } }",
   )
   assert.notEqual(probe, SOURCE, '未能在 client.js 里定位 return 语句，测试探针需要同步更新')
   let registration = null
@@ -219,8 +225,21 @@ function introspectWith(ReactImpl, windowStub = {}) {
    */
   const window = { __ModuleLoader__: { load: (reg) => { registration = reg } }, ...windowStub }
   const document = { querySelector: () => null, createElement: () => ({ setAttribute() {}, textContent: '' }), head: { appendChild() {} } }
-  new Function('require', 'window', 'document', 'globalThis', probe)((s) => (s === 'react' ? ReactImpl : (() => { throw new Error(s) })()), window, document, globalThis)
-  return registration.factory((s) => (s === 'react' ? ReactImpl : (() => { throw new Error(s) })())).__test
+  /*
+   * 官方 primitives 的 Menu 桩：透传 props（open/items/selectedId/onSelect/onClose/
+   * side/portal/anchor），把 anchor 原样放进树里 —— 与生产实现一致（伙伴下拉的
+   * 浮层委托给官方 Menu，测试断言 anchor 按钮与 items 即可）。
+   */
+  const primitivesStub = {
+    Menu: (props) => ReactImpl.createElement('menu-stub', props, props.anchor),
+  }
+  const requireStub = (s) => {
+    if (s === 'react') return ReactImpl
+    if (s === '@deepseek-ai/dsh-client-ui-primitives') return primitivesStub
+    throw new Error(`unexpected require: ${s}`)
+  }
+  new Function('require', 'window', 'document', 'globalThis', probe)(requireStub, window, document, globalThis)
+  return registration.factory(requireStub).__test
 }
 
 /** 表单里的数字输入框（按渲染顺序：触发轮数 / 触发字符数 / 注入预算）。 */
@@ -438,6 +457,95 @@ test('弹窗定位所需的 CSS 规则存在', () => {
   const { CSS } = introspect()
   for (const selector of ['.cmd-overlay{', '.cmd-dialog-sheet{', '.cmd-dialog-head{', '.cmd-dialog-foot{']) {
     assert.ok(CSS.includes(selector), `缺少 ${selector} —— 自建弹窗会退化成无定位的裸 div`)
+  }
+})
+
+test('Dialog 的遮罩样式用模态遮罩 token，不得用下拉浮层的 mask-drop（蓝色背景回归）', () => {
+  const { CSS } = introspect()
+  // 亮色 #0000003d / 暗色 #00000080，官方 Modal.module.css 的 .mask::after 同款。
+  assert.ok(CSS.includes('var(--dsw-alias-bg-mask-1'), '遮罩必须用 --dsw-alias-bg-mask-1（黑色半透明）')
+  assert.ok(!CSS.includes('bg-mask-drop'), '不得使用 --dsw-alias-bg-mask-drop：那是下拉浮层遮罩，暗色主题下呈蓝灰色')
+  // 卡片本体同次改坏：bg-overlay 暗色下也是蓝灰（bluish-700），官方 Modal 卡片用 bg-layer-2。
+  assert.ok(CSS.includes('var(--dsw-alias-bg-layer-2'), '弹窗卡片背景必须用 --dsw-alias-bg-layer-2（官方 Modal .dialog 同款）')
+  assert.ok(!CSS.includes('bg-overlay'), '不得使用 --dsw-alias-bg-overlay：暗色主题下卡片会呈蓝灰色')
+})
+
+test('ConfirmDialog：未勾选时确认键禁用，勾选后可确认；官方组件缺失时退自建且不再用 window.confirm', () => {
+  // introspectWith 的 primitives 桩只有 Menu（Modal / RiskConfirmation 取不到），
+  // 正好落在自建兜底路径上。
+  const runtime = makeStatefulReact()
+  const { ConfirmDialog } = introspectWith(runtime.React)
+  runtime.mount(() => ConfirmDialog({
+    open: true, title: '删除「小花」',
+    warning: '只是移动到备份目录。',
+    onConfirm: () => {}, onCancel: () => {},
+  }))
+
+  let tree = runtime.rerender()
+  const ackBox = findAll(tree, (n) => n.type === 'input' && n.props.type === 'checkbox')[0]
+  assert.ok(ackBox, '自建兜底必须渲染「我已知晓」勾选框')
+
+  // 桩不会自动展开函数组件：Dialog 元素的 footer 挂在 props 上，要进去找按钮。
+  const footerButtons = () => findAll(tree.props?.footer ?? tree, (n) => n.type === 'button')
+  const confirmOf = () => footerButtons().filter((n) => textOf(n).join('').includes('删除'))[0]
+
+  assert.equal(confirmOf().props.disabled, true, '未勾选时确认键必须禁用（RiskConfirmation 语义）')
+
+  ackBox.props.onChange({ currentTarget: { checked: true } })
+  tree = runtime.rerender()
+  assert.equal(confirmOf().props.disabled, false, '勾选后确认键必须可用')
+})
+
+test('AgentList 删除：点垃圾桶先弹确认（官方弹窗形态），确认才发 DELETE；不再走 window.confirm', async () => {
+  const originalFetch = globalThis.fetch
+  const deletes = []
+  globalThis.fetch = async (url, options) => {
+    if (options?.method === 'DELETE') {
+      deletes.push(String(url))
+      return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, archived: 'companions/backup-demo' }) }
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ agents: [{ id: 'demo', name: '小花', description: '' }] }) }
+  }
+
+  const runtime = makeStatefulReact()
+  const { AgentList } = introspectWith(runtime.React)
+  try {
+    runtime.mount(() => AgentList({ onOpen: () => {} }))
+    // load 的 fetch.then 在微任务里，setImmediate 一轮只推进一格，
+    // flush() 的同步 drain 追不上 —— 参照 mountDetail 用交替等待。
+    let tree
+    for (let i = 0; i < 10; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+      runtime.flush()
+    }
+    tree = runtime.rerender()
+
+    const trash = findAll(tree, (n) => n.type === 'button' && n.props.title === '删除')[0]
+    assert.ok(trash, '应能找到删除按钮')
+    trash.props.onClick()
+
+    // 桩不展开函数组件，ConfirmDialog 在树里是元素节点：从 props 断言弹窗已开。
+    tree = runtime.rerender()
+    assert.equal(deletes.length, 0, '确认前不得发 DELETE')
+    const dialog = findAll(tree, (n) => typeof n.type === 'function' && n.type.name === 'ConfirmDialog')[0]
+    assert.ok(dialog, '点删除后应渲染确认弹窗（不再是 window.confirm）')
+    assert.equal(dialog.props.open, true, '确认弹窗应处于打开状态')
+    assert.ok(String(dialog.props.title).includes('小花'), '弹窗标题应指明目标伙伴')
+    assert.ok(String(dialog.props.warning).includes('备份'), '弹窗应说明「移到备份」的真实行为')
+
+    // 勾选门槛在 ConfirmDialog 专项测试里覆盖；这里驱动确认回调，验证删除流程。
+    await dialog.props.onConfirm()
+    for (let i = 0; i < 10; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+      runtime.flush()
+    }
+    tree = runtime.rerender()
+    assert.equal(deletes.length, 1, '确认后应发一次 DELETE')
+    assert.ok(deletes[0].endsWith('/agents/demo'), `DELETE 路径不对：${deletes[0]}`)
+    const dialogAfter = findAll(tree, (n) => typeof n.type === 'function' && n.type.name === 'ConfirmDialog')[0]
+    assert.equal(dialogAfter, undefined, '删除完成后弹窗应关闭')
+  } finally {
+    globalThis.fetch = originalFetch
   }
 })
 
@@ -945,15 +1053,13 @@ test('伙伴下拉：会话身份取自 sessionId/useSession，取不到就不�
     await new Promise((resolve) => setImmediate(resolve))
     const rendered = picker.runtime.flush()
 
-    const button = findAll(rendered, (n) => n.type === 'button' && n.props.className === 'cmd-chip')[0]
-    assert.ok(button, '新建会话里应渲染出可点的下拉按钮，而不是被锁成只读文本')
-    assert.ok(textOf(button).join('').includes('无伙伴'), '未绑定时应显示「无伙伴」')
+    const trigger = triggerOf(rendered)
+    assert.ok(trigger, '新建会话里应渲染出可点的下拉按钮，而不是被锁成只读文本')
+    assert.ok(textOf(trigger).join('').includes('伙伴：无'), '未绑定时应显示「伙伴：无」')
 
-    // 展开后能列出伙伴 + 「无伙伴」选项
-    button.props.onClick()
-    const opened = picker.runtime.rerender()
-    const items = findAll(opened, (n) => n.props && n.props.className === 'cmd-menu-item')
-    assert.equal(items.length, 2, '菜单应含「无伙伴」与一个伙伴')
+    // Menu 的 items 应含「无」+ 一个伙伴（官方 Menu 桩透传 props）
+    const items = menuItemsOf(rendered)
+    assert.equal(items.length, 2, '菜单应含「无」与一个伙伴')
   } finally {
     picker.restore()
   }
@@ -967,14 +1073,15 @@ test('伙伴下拉：选中伙伴走 PUT /companion 并带上 session', async ()
   try {
     picker.mount()
     await new Promise((resolve) => setImmediate(resolve))
-    let rendered = picker.runtime.flush()
+    const rendered = picker.runtime.flush()
 
-    findAll(rendered, (n) => n.type === 'button' && n.props.className === 'cmd-chip')[0].props.onClick()
-    rendered = picker.runtime.rerender()
-    const lily = findAll(rendered, (n) => n.props && n.props.className === 'cmd-menu-item' && textOf(n).join('') === '莉莉')[0]
+    // Menu 桩：items 是数据，onSelect 在 Menu 顶层 props（官方契约）
+    const items = menuItemsOf(rendered)
+    const lily = items.find((item) => item.label === '莉莉')
     assert.ok(lily, '菜单里应能按昵称找到伙伴')
 
-    await lily.props.onClick()
+    const stub = menuStubOf(rendered)
+    await stub.props.onSelect(lily.id)
     await new Promise((resolve) => setImmediate(resolve))
 
     const put = picker.calls.find((item) => item.method === 'PUT')
@@ -1053,10 +1160,117 @@ test('伙伴下拉：伙伴模式预设下照常显形（闸门不误伤自己�
     picker.mount()
     await new Promise((resolve) => setImmediate(resolve))
     const tree = picker.runtime.flush()
-    const button = findAll(tree, (n) => n.type === 'button' && n.props.className === 'cmd-chip')[0]
-    assert.ok(button, '伙伴模式会话应渲染下拉')
+    const trigger = triggerOf(tree)
+    assert.ok(trigger, '伙伴模式会话应渲染下拉')
+    assert.ok(textOf(trigger).join('').includes('伙伴：无'), 'trigger 文案为「伙伴：无」')
     assert.equal(picker.calls.length, 1, '应恰好发一次列表请求')
   } finally {
     picker.restore()
+  }
+})
+
+/** 官方 Menu 桩渲染出的 anchor trigger 按钮（className=cmd-picker-trigger）。 */
+function triggerOf(tree) {
+  const stub = menuStubOf(tree)
+  return findAll(stub, (n) => n.type === 'button' && n.props.className === 'cmd-picker-trigger')[0]
+}
+
+/** 官方 Menu 桩透传的 items（{id,label,onSelect} 数组）。 */
+function menuItemsOf(tree) {
+  const stub = menuStubOf(tree)
+  return stub ? stub.props.items : []
+}
+
+/**
+ * 官方 Menu 在树里是 type 为函数的节点（h(OfficialMenu, props)）——
+ * 测试树不做组件求值，这里手动解一层：调用函数组件拿到 menu-stub 元素。
+ */
+function menuStubOf(tree) {
+  const fnNode = findAll(tree, (n) => typeof n.type === 'function' && n.props && 'anchor' in n.props)[0]
+  if (!fnNode) return null
+  return fnNode.type(fnNode.props)
+}
+
+/* ─────────── W8：选伙伴失败必须看得见 ───────────
+ * pick() 失败（409 / 网络错误）原来只写 state.error 而渲染层从不读——
+ * 用户以为选上了，实际绑定没变。现在失败会在触发器位置显示红色错误，
+ * 5 秒后自动还原；再次选择成功则立即清除。
+ * ------------------------------------------------------------------ */
+
+/** 挂载一个可精确控制 PUT 成败的下拉：列表正常拉取，PUT 按 putFails 走。 */
+function mountPickerWithPut({ putFails = false, companions = [{ id: 'lily', name: '莉莉' }] } = {}) {
+  const calls = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), method: options?.method ?? 'GET' })
+    if (options?.method === 'PUT' && putFails) {
+      return { ok: false, status: 409, text: async () => JSON.stringify({ error: '对话已开始，伙伴不可更改' }) }
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ companions, current: null }) }
+  }
+  const runtime = makeStatefulReact()
+  const { CompanionPicker } = introspectWith(runtime.React)
+  const useSession = (selector) => selector({ sessionId: 's1', blank: true })
+  const useSessions = (selector) => selector({ byId: { s1: { projectionValues: { agentPreset: 'companion-mode' } } } })
+  return {
+    runtime, calls, originalFetch,
+    mount: () => runtime.mount(() => CompanionPicker({ sessionId: 's1', useSession, useSessions })),
+    restore: () => { globalThis.fetch = originalFetch },
+  }
+}
+
+test('伙伴下拉：选伙伴失败时显示红色错误（W8——失败不再静默）', async () => {
+  const picker = mountPickerWithPut({ putFails: true })
+  try {
+    picker.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    // 先选中伙伴：PUT 失败
+    const stub = menuStubOf(picker.runtime.flush())
+    await stub.props.onSelect('lily')
+    await new Promise((resolve) => setImmediate(resolve))
+    const tree = picker.runtime.flush()
+
+    const errNode = findAll(tree, (n) => String(n.props?.className ?? '').includes('cmd-err'))[0]
+    assert.ok(errNode, 'PUT 失败后应渲染出带 cmd-err 的错误提示')
+    assert.ok(textOf(errNode).join('').includes('对话已开始'), '错误文案应来自服务端 409 响应')
+  } finally {
+    picker.restore()
+  }
+})
+
+test('伙伴下拉：失败提示可点击清除并回到正常下拉', async () => {
+  let putFails = true
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    if (options?.method === 'PUT') {
+      if (putFails) return { ok: false, status: 409, text: async () => JSON.stringify({ error: '对话已开始，伙伴不可更改' }) }
+      return { ok: true, status: 200, text: async () => JSON.stringify({ current: 'lily' }) }
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ companions: [{ id: 'lily', name: '莉莉' }], current: null }) }
+  }
+  try {
+    const runtime = makeStatefulReact()
+    const { CompanionPicker } = introspectWith(runtime.React)
+    const useSession = (selector) => selector({ sessionId: 's1', blank: true })
+    const useSessions = (selector) => selector({ byId: { s1: { projectionValues: { agentPreset: 'companion-mode' } } } })
+    runtime.mount(() => CompanionPicker({ sessionId: 's1', useSession, useSessions }))
+    await new Promise((resolve) => setImmediate(resolve))
+
+    // 第一次：失败 → 出现错误
+    const stub1 = menuStubOf(runtime.flush())
+    await stub1.props.onSelect('lily')
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.ok(findAll(runtime.flush(), (n) => String(n.props?.className ?? '').includes('cmd-err'))[0], '失败后应有错误')
+
+    // 第二次：服务端恢复 → 用户点击错误提示（onClick 清除错误）→ 回到正常下拉
+    putFails = false
+    const errNode = findAll(runtime.flush(), (n) => String(n.props?.className ?? '').includes('cmd-err'))[0]
+    await errNode.props.onClick()
+    await new Promise((resolve) => setImmediate(resolve))
+    const tree2 = runtime.flush()
+    assert.equal(findAll(tree2, (n) => String(n.props?.className ?? '').includes('cmd-err'))[0], undefined, '清除后错误不再显示')
+    assert.ok(menuStubOf(tree2), '回到正常下拉渲染')
+  } finally {
+    globalThis.fetch = originalFetch
   }
 })

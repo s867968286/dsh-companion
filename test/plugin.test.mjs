@@ -12,7 +12,7 @@ import { pathToFileURL } from 'node:url'
 import { apply, inject, localTimestamp, MAX_REVIEW_ATTEMPTS, name } from '../src/preset.js'
 import { createSessionFreeze } from '../src/core.js'
 import { dateKey } from '../src/memory-store.mjs'
-import { resolvePaths, writeSettings } from '../src/settings.mjs'
+import { resolvePaths, writeBinding, writeSettings } from '../src/settings.mjs'
 
 /** 官方会话格式 v4 的准入函数（真包）：用来校验本插件写出的消息 source。 */
 const assertV4RowAdmission = (await import('@deepseek-ai/dsh-session-format-v3-to-v4')).assertV4RowAdmission
@@ -207,7 +207,7 @@ test('apply：注册三个记忆工具，tools.deny 下发收窄', () => {
 
   assert.deepEqual(
     ctx.registered.map((tool) => tool.name),
-    ['preset_md_search', 'preset_md_journal', 'preset_md_memory'],
+    ['companion_search', 'companion_journal', 'companion_memory'],
   )
   assert.deepEqual(ctx.restricted, [{ deny: ['mnemon_recall'] }])
   rmSync(dir, { recursive: true, force: true })
@@ -225,8 +225,57 @@ test('apply：没有伙伴目录时工具仍注册，但调用时不做任何事
   apply(ctx, {})
   assert.equal(ctx.registered.length, 3, '三个记忆工具都应注册')
   // 目录取不到时，工具调用会给出明确拒绝而不是瞎写一个目录
-  const journal = ctx.registered.find((tool) => tool.name === 'preset_md_journal')
+  const journal = ctx.registered.find((tool) => tool.name === 'companion_journal')
   assert.equal(typeof journal?.execute, 'function')
+})
+
+test('apply：注册时不得固化目录——两个会话绑不同伙伴，同一工具实例各写各的（W2）', async () => {
+  /*
+   * 这是 W2 的**注册点**断言，必须经过真实的 apply()，否则测不出来：
+   * 旧写法 `factory(dirFor())` 在注册那一刻就把目录解析成字符串固化进工具，
+   * 于是所有会话共用一个目录；新写法传函数本身，由 execute 按 exec.agent 现取。
+   *
+   * 判据：同一份注册定义，用两个不同会话的 agent 各执行一次，
+   * 两次写入必须分别落在**各自绑定的伙伴目录**里。
+   */
+  const pluginDir = mkdtempSync(join(tmpdir(), 'companion-w2-plugin-'))
+  const home = mkdtempSync(join(tmpdir(), 'companion-w2-home-'))
+  const paths = resolvePaths(home)
+  for (const id of ['lily', 'alice']) {
+    mkdirSync(join(paths.companionsRoot, id), { recursive: true })
+  }
+  // 两个会话分别绑定不同伙伴
+  await writeBinding(paths, 'sess-lily', 'lily')
+  await writeBinding(paths, 'sess-alice', 'alice')
+
+  const prevHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const ctx = makeCtx(undefined) // 插件自己的 baseUrl 取不到 → 回落目录为空
+    apply(ctx, {})
+    const journal = ctx.registered.find((tool) => tool.name === 'companion_journal')
+    assert.ok(journal, '应注册 companion_journal')
+
+    const asAgent = (sessionId) => ({ session: { id: sessionId } })
+    await journal.execute({ body: '写给莉莉' }, { agent: asAgent('sess-lily') })
+    await journal.execute({ body: '写给她' }, { agent: asAgent('sess-alice') })
+
+    const lilyFile = join(paths.companionsRoot, 'lily', 'memory', `${dateKey()}.md`)
+    const aliceFile = join(paths.companionsRoot, 'alice', 'memory', `${dateKey()}.md`)
+    assert.ok(existsSync(lilyFile), `莉莉的日志应写进自己的目录：${lilyFile}`)
+    assert.ok(existsSync(aliceFile), `另一位伙伴的日志应写进自己的目录：${aliceFile}`)
+    assert.ok(readFileSync(lilyFile, 'utf8').includes('写给莉莉'))
+    assert.ok(readFileSync(aliceFile, 'utf8').includes('写给她'))
+    assert.ok(
+      !readFileSync(aliceFile, 'utf8').includes('写给莉莉'),
+      '注册时固化目录会让两个会话写同一个地方——这正是 W2 的旧行为',
+    )
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = prevHome
+    rmSync(pluginDir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 test('apply：单个工具注册失败不影响其余工具', () => {
@@ -235,7 +284,7 @@ test('apply：单个工具注册失败不影响其余工具', () => {
   let calls = 0
   ctx.tools.register = (definition) => {
     calls += 1
-    if (definition.name === 'preset_md_journal') throw new Error('模拟注册失败')
+    if (definition.name === 'companion_journal') throw new Error('模拟注册失败')
     ctx.registered.push(definition)
   }
   apply(ctx, {})
@@ -243,9 +292,9 @@ test('apply：单个工具注册失败不影响其余工具', () => {
   assert.equal(calls, 3)
   assert.deepEqual(
     ctx.registered.map((tool) => tool.name),
-    ['preset_md_search', 'preset_md_memory'],
+    ['companion_search', 'companion_memory'],
   )
-  assert.ok(ctx.logs.warn.join('\n').includes('preset_md_journal 注册失败'))
+  assert.ok(ctx.logs.warn.join('\n').includes('companion_journal 注册失败'))
   rmSync(dir, { recursive: true, force: true })
 })
 

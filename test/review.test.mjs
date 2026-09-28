@@ -105,12 +105,12 @@ test('searchJournal：days 是「日志文件个数」上限，不是自然日',
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('createSearchTool：工具名带 preset_md_ 前缀，execute 返回文本', async () => {
+test('createSearchTool：工具名带 companion_ 前缀，execute 返回文本', async () => {
   const dir = makeDir()
   await appendJournal(dir, '### 讨论与解决\n\nhello world', new Date())
   const tool = createSearchTool(dir)
   assert.equal(tool.name, SEARCH_TOOL_NAME)
-  assert.equal(tool.name.startsWith('preset_md_'), true)
+  assert.equal(tool.name.startsWith('companion_'), true)
   // parameters 必须是标准 JSON Schema 形态（扁平 DSL 会让 provider 400，见 search.mjs 注释）
   assert.equal(tool.parameters.type, 'object')
   assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ['days', 'query'])

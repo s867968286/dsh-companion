@@ -1,10 +1,10 @@
 /**
- * dsh-companion 的 Host 半（bundle 行，host 平面）：给「伙伴设置」页面提供
- * HTTP 接口，读写 `<dshHome>/.agent-presets/<id>/` 下的文件。
+ * dsh-companion 的 Host 半（bundle 行，host 平台）：给「伙伴设置」页面提供
+ * HTTP 接口，读写 `<dshHome>/companion/companions/<id>/` 下的文件。
  *
  * 设计约束：
- * - 只读/写 preset 目录与自己的设置文件，不碰别处；
- * - 删除 = 移动到 `<dshHome>/.agent-presets-backup/<id>-<时间戳>/`，不真删；
+ * - 只读/写伙伴目录与自己的设置文件，不碰别处；
+ * - 删除 = 移动到 `<dshHome>/companion/companions-backup/<id>-<时间戳>/`，不真删；
  * - 无第三方依赖：preset.yml 用极简正则读写（只有 name/description/order 三个字段）。
  */
 import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
@@ -21,12 +21,14 @@ import {
 import {
   DEFAULT_SETTINGS,
   deleteBinding,
+  deleteBindingsFor,
   readBindings,
   readSettings,
   resolvePaths,
   writeSettings,
 } from './settings.mjs'
-import { companionPresetMeta, companionPresetPlugins } from './companion-preset.mjs'
+import { COMPANION_PRESET_ID, companionPresetMeta, companionPresetPlugins } from './companion-preset.mjs'
+import { collectOrphanBindings } from './binding-gc.mjs'
 import { PRESET_FILES, renderAllTemplates } from './templates.mjs'
 import { sessionEvents } from './core.js'
 
@@ -79,17 +81,20 @@ function assertLength(value, max, label) {
 /**
  * 该值能否不加引号直接写（保守：只放行安全字符）。
  *
- * **必须额外拒绝 YAML 会隐式类型化的形态**——这是本插件最容易踩的坑：
- * 官方用 js-yaml 读这个文件（`dsh-agent-presets` 的 `readPresetMetadata`），
- * 而未加引号的 `123` / `true` / `null` / `~` / `2026-09-13` 会被读成
- * number / boolean / null / Date，而不是字符串。实测：
+ * **必须额外拒绝 YAML 会隐式类型化的形态**——这是本插件最容易踩的坑。
  *
- *   name: 123          -> typeof 'number'
- *   name: true         -> typeof 'boolean'
- *   name: 2026-09-13   -> Date 实例
+ * 实况（rc2）：`preset.yml` 已**没有官方读取方**——官方预设改由 bundle 声明，
+ * 旧的目录元数据读取（`dsh-agent-presets` 的 `readPresetMetadata`）已不存在，
+ * 全树搜不到读它的代码。但**格式仍按 YAML 约定维护**，因为：
+ * 1. 用户会手工编辑它，手写时不会在意引号；
+ * 2. 将来若要回到"官方可识别"的形态，文件得是合法 YAML 且类型正确。
  *
- * 官方对类型不符的字段是**静默降级成 undefined**（`text()` 只接受 string），
- * 于是昵称在预设选择器里悄悄消失、回落显示成 `companion-xxxx`——不报错，只丢数据。
+ * 未加引号时 `123` / `true` / `null` / `~` / `2026-09-13` 会被 YAML 解析成
+ * number / boolean / null / Date 而非字符串。**实际受害的是 `order`**：
+ * `readPresetMeta` 对它做 `Number(orderText)`，`2026-09-13` 这类值会被解析失败
+ * 而**整条 order 丢失**（回落 undefined），该伙伴于是掉到列表末尾。
+ * 实测：`order: 2026-09-13` → 读回结果里没有 order。
+ *
  * 所以这些形态一律强制加引号，让它作为字符串被读回。
  */
 export function isPlainSafe(text) {
@@ -186,10 +191,10 @@ export function readPresetMeta(dir) {
  *
  * ## 为什么是「按行合并」而不是整文件重写
  *
- * preset.yml **不是本插件独有的文件**：它归官方 `@deepseek-ai/dsh-agent-presets`
- * 管理（`METADATA_FILE = 'preset.yml'`），官方只在「复制预设」时用 js-yaml 重写它。
- * 用户完全可以手工往里加注释、或加官方当前不读的键（`id` / `model` / `tools.deny` …），
- * 甚至整份手写。
+ * preset.yml **不是本插件独有的文件**：它是从"伙伴即官方预设目录"那个时代
+ * 继承下来的格式（当时归官方 `@deepseek-ai/dsh-agent-presets` 管理，
+ * 该包在 rc2 已不存在）。现在**只有本插件读它**，但用户仍会手工编辑：
+ * 加注释、加本项目不读的键（`id` / `model` / `tools.deny` …），甚至整份手写。
  *
  * 早先这里是「三个字段写全、其余丢弃」的整文件重写，实测改一次昵称就会把
  * 注释与 `id` / `model` / `tools.deny` 全部抹掉——而 `readPresetMeta` 只读三个字段，
@@ -197,11 +202,13 @@ export function readPresetMeta(dir) {
  *
  * ## 三条写法规则
  *
- * - **order 为 undefined 时不写该行**（而不是写 0）。官方排序是
- *   `order ?? Infinity`（无 order 排最后），写成 0 会让手工预设从列表末尾
- *   跳到最前——正好与「缺 order 排最后」相反。
- * - **description 为空时同样不新增该行**，与官方 `renderPresetMetadata`
- *   「省略 undefined 而非写空」一致；但**原文里已有该行就照常更新**
+ * - **order 为 undefined 时不写该行**（而不是写 0）。缺失要排在最后：
+ *   官方对**预设声明**的排序是 `order ?? Infinity`
+ *   （`dsh-agent-preset-registry/lib/index.js:587`），本插件 `listAgents` 也用
+ *   `order ?? Number.MAX_SAFE_INTEGER` 对齐同一语义。写成 0 会让它从列表末尾
+ *   跳到最前——正好相反。
+ * - **description 为空时同样不新增该行**（「省略」而非「写空」），保持与
+ *   `order` 一致的"没设过就不落行"约定；但**原文里已有该行就照常更新**
  *   （含更新成 `""`）——用户显式清空签名与「从来没设过」是两件事。
  * - **name 始终写**：昵称是必须项。调用方已保证非空（`/meta` 显式拒绝清空），
  *   这里空值也会落一行显式空串，免得「没昵称」和「没这文件」分不清。
@@ -231,8 +238,8 @@ export function mergePresetMeta(prev, { name, description, order }) {
   if (name !== undefined) wanted.set('name', { line: `name: ${quote(name)}`, append: true })
   if (description !== undefined) {
     /*
-     * 空的 description **只更新已有行、不新增**：与官方
-     * `renderPresetMetadata`（省略 undefined）一致。
+     * 空的 description **只更新已有行、不新增**：与 order 同一约定
+     * ——「没设过就不落行」，避免把从未声明过的字段固化进文件。
      * 有值则允许追加——用户确实设了签名，不该因为原文没这行就丢掉。
      */
     const text = quote(description)
@@ -480,7 +487,7 @@ export function copyAgent(paths, sourceId, { name } = {}) {
   const order = nextOrder(paths)
   /*
    * description：源有值就沿用，源没有（读成 ''）就**不写这一行**——
-   * 与官方 `renderPresetMetadata` 的「省略 undefined 而非写空」一致，
+   * 遵循「没设过就不落行」的约定（同 order），
    * 避免把一个从未声明过的字段固化进副本。
    */
   writePresetMeta(dir, {
@@ -541,16 +548,30 @@ export function listLegacyAgents(paths) {
     })
 }
 
-/** 删除 = 移动到备份目录（不真删）。 */
-export function archiveAgent(paths, id, now = new Date()) {
+/**
+ * 删除 = 移动到备份目录（不真删）。
+ *
+ * 同时清掉所有指向该伙伴的会话绑定：伙伴目录都没了，留着绑定只会在重开
+ * 那些会话时解析到一个不存在的目录 —— 静默不注入，且记录永不消失。
+ * 这正是绑定表**不再随 agent/disposed 清理**之后必须补上的那个清理点。
+ */
+export async function archiveAgent(paths, id, now = new Date()) {
   if (!PRESET_ID.test(id)) throw new Error(`非法 id：${id}`)
   const dir = join(paths.companionsRoot, id)
   if (!existsSync(dir)) throw new Error(`伙伴不存在：${id}`)
   const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}-${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
   const target = join(paths.backupRoot, `${id}-${stamp}`)
   mkdirSync(paths.backupRoot, { recursive: true })
-  renameSync(dir, target)
-  return { archived: target }
+  try {
+    renameSync(dir, target)
+  } catch {
+    // 跨卷时 rename 会失败（与 migrateAgent 同一处理）：退回递归拷贝后删源。
+    cpSync(dir, target, { recursive: true })
+    rmSync(dir, { recursive: true, force: true })
+  }
+  let bindingsRemoved = 0
+  try { bindingsRemoved = (await deleteBindingsFor(paths, id)).removed } catch { /* 绑定清理失败不影响归档 */ }
+  return { archived: target, bindingsRemoved }
 }
 
 /** 日记列表（日期倒序）。id 与日期都做校验，避免路径穿越。 */
@@ -735,6 +756,39 @@ function companionBindingOf(paths, session) {
 }
 
 /**
+ * 会话的**当前官方预设**。
+ *
+ * 读法（两级，缺一不可）：
+ * 1. 事件流里最后一条 `agent-preset/selected`（官方 select 会在 blank 窗口内
+ *    append 这条事件，见 `dsh-agent-preset-registry/lib/index.js:761`）；
+ * 2. 没有这条事件 → 回落到 **创建记录里的 `header.agentPreset`**。
+ *
+ * ⚠️ 第 2 级不能省。会话创建时就带着预设（实测会话文件第 1 行：
+ * `{"type":"session",…,"agentPreset":"standard-gitbash"}`），若只看事件流，
+ * 「建好就选伙伴、从没切过档」的会话会被判成"识别不出预设"而拒绝注入。
+ * 队友插件 dsh-tavern-v2 在这里踩过坑并写进了注释：那行创建记录**不含**
+ * `agent-preset/selected` 或 `header` 字样，靠字样匹配会一路漏判。
+ *
+ * 为什么不读投影 store：host 侧的 session 对象不直接暴露投影当前值，
+ * 而事件流本身就是这个投影的 fold 源（`agentPresetProjectionDefinition.apply`），
+ * 从事件流读与官方读法等价。
+ *
+ * @returns 'companion-mode' | 其他预设 id | undefined（两级都拿不到）。
+ */
+function sessionPresetOf(session) {
+  let current
+  for (const event of readSessionEvents(session)) {
+    if (event?.type === 'agent-preset/selected') current = event?.data?.agentPreset
+  }
+  if (typeof current === 'string' && current !== '') return current
+  // 回落到创建记录：会话对象上没有 header 时返回 undefined（旧版本 / 假 ctx）。
+  const header = session?.header
+  return typeof header?.agentPreset === 'string' && header.agentPreset !== ''
+    ? header.agentPreset
+    : undefined
+}
+
+/**
  * 伙伴绑定是否还允许修改。
  *
  * 规则（用户要求）：**开对话前可选，开对话后锁定**。
@@ -815,7 +869,40 @@ export function registerRoutes(ctx, home) {
      * 那时由 /api/companion 补上。
      *
      * 读法：先查绑定表，再兜底折叠事件流（兼容历史上写进日志的旧绑定）。
+     *
+     * ⚠️ 装注入前必须核对**当前官方预设**：伙伴绑定只对「伙伴模式」会话有意义。
+     * 用户可以在 blank 窗口内把会话从伙伴模式切到标准模式（官方 select 允许），
+     * 切换会 append `agent-preset/selected` —— 若不看这条事件，恢复旧会话时
+     * 绑定表里的残留会让"标准模式的会话"装上伙伴人设：官方提示词 + 莉莉人设
+     * 同时在跑，工具集却是标准模式的全套（正是实测出的事故）。
      */
+    /*
+     * 装注入前先判两件事，顺序不能反：
+     *
+     * ① **是不是伙伴模式**（只看预设）——伙伴绑定只对「伙伴模式」会话有意义。
+     *    用户可以在 blank 窗口内把会话从伙伴模式切到标准模式（官方 select 允许），
+     *    切换会 append `agent-preset/selected` —— 若不看这条事件，恢复旧会话时
+     *    绑定表里的残留会让"标准模式的会话"装上伙伴人设：官方提示词 + 莉莉人设
+     *    同时在跑，工具集却是标准模式的全套（正是实测出的事故）。
+     *
+     *    **识别不出就当作不是**：事件流里既没有 `agent-preset/selected`、
+     *    header 里也没有 `agentPreset` 时，我们无法确认这是伙伴会话，
+     *    宁可少注入也不能错注入 —— 错注入会把官方提示词整个顶掉。
+     *    这条判据只回答"能不能注入"，**不回答"是哪个伙伴"**。
+     *
+     * ② **是哪个伙伴**（binding 优先，事件流兜底）——见 companionBindingOf。
+     */
+    const presetNow = sessionPresetOf(session)
+    if (presetNow !== COMPANION_PRESET_ID) {
+      // 明确切到了别的预设：清掉残留绑定，保持与预设一致。
+      // 识别不出预设时同样走这里，但**不动绑定表**（拿不准就不破坏数据）。
+      if (presetNow !== undefined) {
+        // 写绑定是异步的（共用按路径队列）：这里不 await（在同步监听器里），
+        // 但必须挂 catch —— 否则一次失败会变成 unhandledRejection。
+        deleteBinding(paths, session.id).catch(() => { /* 清不掉也不装注入 */ })
+      }
+      return
+    }
     const bound = companionBindingOf(paths, session)
     if (!bound) return
     const dir = join(paths.companionsRoot, bound)
@@ -839,14 +926,62 @@ export function registerRoutes(ctx, home) {
     sessionIndex.delete(session.id)
     agentCtxBySession.delete(session.id)
     /*
-     * 绑定表按 sessionId 索引，必须随会话销毁清理 ——
-     * 否则每开一个会话就多一行，文件无限增长（这正是当初选事件流、
-     * 靠"会话删除即日志删除"自动一致的理由）。
+     * ⚠️ 这里**不再**删绑定表里的记录。
+     *
+     * `agent/disposed` 的含义是「这个活着的 agent 对象被注销了」
+     * （官方定义：注册它的 fiber 被卸载时触发，见 dsh-agent/lib/index.js:472-486），
+     * 它**不等于**「会话没用了」——进程重启、归档、临时关闭窗口都会触发。
+     *
+     * 早先在这里 deleteBinding，后果是：重开一个历史会话时绑定已经不在，
+     * 于是伙伴人设静默丢失（回落官方提示词，没有任何提示）——而恢复的唯一
+     * 正式来源就是这张表，删掉它等于把恢复兜底作废（评审 W3）。
+     *
+     * 所以绑定改为**按会话语义**存活：
+     * - 会话明确切到别的预设（`agent-preset/selected`）→ 删（那里删，见下方监听）；
+     * - 用户在设置页删除伙伴 → 删（见 deleteAgent 的清理）；
+     * - 其余情况保留，重开会话时按 binding 装回人设。
+     *
+     * 代价是文件会随「用过的会话数」增长。这个代价是明知的：一行只是一个
+     * sessionId + 伙伴 id，且清理点覆盖了真正代表"这段关系结束了"的两种事件。
      */
-    try { deleteBinding(paths, session.id) } catch { /* 清理失败不影响销毁 */ }
     // 会话销毁时撤掉该会话的 section/变量，避免泄漏到别的会话。
     try { injections.get(session.id)?.dispose() } catch { /* 已撤 */ }
     injections.delete(session.id)
+  })
+
+  /*
+   * 官方预设切换：`agent-preset/selected` 由 agent-preset-registry 广播
+   * （`dsh-agent-preset-registry/lib/index.js:489`，签名 `(sessionId, presetId)`）。
+   *
+   * 为什么必须听它：伙伴人设注入与官方预设是**两层独立的东西** ——
+   * 预设决定工具集，伙伴决定 persona section。用户在 blank 窗口内把会话从
+   * 「伙伴模式」切到「标准模式」时，官方只换工具集，不会通知我们撤人设 ——
+   * 不处理就成了"标准模式的全套工具 + 莉莉的人设"（实测事故）。
+   *
+   * - 切**走**（→ 非 companion-mode）：撤该会话注入 + 删绑定。绑定不删的话，
+   *   会话重开时 agent/created 又会按残留绑定装回人设。
+   * - 切**回**（→ companion-mode）：恢复绑定表里可能存在的记录（切走时刚删了，
+   *   这里通常无事可做；从其他路径恢复的会话则能装回）。
+   */
+  ctx.on?.('agent-preset/selected', (sessionId, presetId) => {
+    if (typeof sessionId !== 'string' || sessionId === '') return
+    if (presetId === COMPANION_PRESET_ID) {
+      // 切回伙伴模式：若绑定表还有记录（例如事件流兜底来的旧绑定），装回注入。
+      const bound = readBindings(paths)[sessionId]
+      const dir = bound ? join(paths.companionsRoot, normalizeCompanion(bound)) : ''
+      const agentCtx = agentCtxOf(sessionId)
+      if (!dir || !existsSync(dir) || !agentCtx || injections.has(sessionId)) return
+      try {
+        injections.set(sessionId, injectCompanionPrompt(agentCtx, dir, () => readSettings(paths)))
+      } catch (error) {
+        ctx.logger?.warn?.(`[companion] 会话 ${sessionId} 切回伙伴模式装回注入失败：${describeError(error)}`)
+      }
+      return
+    }
+    // 切走到其他预设：撤人设 + 清绑定，让会话回到"纯官方"状态。
+    try { injections.get(sessionId)?.dispose() } catch { /* 已撤 */ }
+    injections.delete(sessionId)
+    deleteBinding(paths, sessionId).catch(() => { /* 清理失败不影响切换 */ })
   })
 
   const guard = (fn) => async (req, res) => {
@@ -927,7 +1062,8 @@ export function registerRoutes(ctx, home) {
         if (!canRebind(session)) {
           return sendJson(res, 409, { error: '对话已开始，伙伴不可更改（新开一个对话即可重新选择）' })
         }
-        recordCompanionSelection(paths, sessionId, wanted)
+        // 必须 await：绑定落盘失败要如实报给用户（5xx），不能让界面显示"选上了"。
+        await recordCompanionSelection(paths, sessionId, wanted)
 
         /*
          * 立刻把注入换成新绑定 —— 用户选完伙伴就要生效，不能等到下次重启。
@@ -969,7 +1105,7 @@ export function registerRoutes(ctx, home) {
       const sub = agentMatch[2] ?? ''
 
       if (sub === '' && method === 'GET') return sendJson(res, 200, { agent: readAgent(paths, id) })
-      if (sub === '' && method === 'DELETE') return sendJson(res, 200, archiveAgent(paths, id))
+      if (sub === '' && method === 'DELETE') return sendJson(res, 200, await archiveAgent(paths, id))
       if (sub === '/copy' && method === 'POST') {
         const body = await readJson(req)
         if (!body) return sendJson(res, 400, { error: '请求体不是合法 JSON' })
@@ -1049,5 +1185,34 @@ export function apply(ctx, config = {}) {
     })
   } catch (error) {
     ctx.logger?.warn?.(`[companion] 伙伴模式预设注册失败：${describeError(error)}`)
+  }
+
+  /*
+   * 孤儿绑定清理（GC）：绑定不再随 agent/disposed 清除（那会让重开会话恢复不了
+   * 人设），所以会在用户彻底删掉会话后留下残留。这里在启动时清理一次。
+   *
+   * 三条纪律：
+   * - **异步、不阻塞**：`listSessions` 可能要读持久化后端，绝不能挡在 apply 里；
+   * - **服务可能不存在**（headless profile）：取不到就什么都不做，不是错误；
+   * - **失败静默降级**：清理只是维护性工作，出错绝不打扰用户（只记 info/warn）。
+   *
+   * 真正防误删与防并发覆盖的逻辑在 binding-gc.mjs 里（判据用 persisted，
+   * 写回在按路径队列内重读最新表）。
+   */
+  try {
+    ctx.inject(['sessionQuery'], (scope) => {
+      const paths = resolvePaths(config.dshHome)
+      void collectOrphanBindings(paths, scope?.sessionQuery)
+        .then((removed) => {
+          if (removed.length > 0) {
+            ctx.logger?.info?.(`[companion] 已清理 ${removed.length} 条孤儿会话绑定`)
+          }
+        })
+        .catch((error) => {
+          ctx.logger?.warn?.(`[companion] 孤儿绑定清理失败（不影响其余功能）：${describeError(error)}`)
+        })
+    })
+  } catch (error) {
+    ctx.logger?.warn?.(`[companion] 孤儿绑定清理未执行：${describeError(error)}`)
   }
 }

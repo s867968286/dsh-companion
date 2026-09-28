@@ -128,8 +128,8 @@ test('preset.yml：有值的字段照常写，order 0 也保留', () => {
   const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
   assert.ok(text.includes('name: x'))
   /*
-   * 空的 description **不新增该行**（与官方 renderPresetMetadata 的
-   * 「省略而非写空」一致）；但原文里已有该行时仍会更新成 `""`。
+   * 空的 description **不新增该行**（遵循「没设过就不落行」的约定，
+   * 与 order 一致）；但原文里已有该行时仍会更新成 `""`。
    * 见 writePresetMeta 的注释。
    */
   assert.ok(!text.includes('description:'), '原文没有 description 时不该凭空补一行空值')
@@ -143,8 +143,9 @@ test('preset.yml：只替换三个已知键，注释与其余字段原样保留'
   const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   /*
-   * preset.yml 归官方 dsh-agent-presets 管理，用户可以在里面放官方当前不读的键
-   * （id / model / tools）与注释。整文件重写会把这些静默抹掉——这条锁住「不抹」。
+   * preset.yml 是从"伙伴即官方预设目录"时代继承的格式，用户会手工往里放
+   * 本项目不读的键（id / model / tools）与注释。整文件重写会把这些静默抹掉
+   * ——这条锁住「不抹」。
    */
   writeFileSync(join(dir, 'preset.yml'), [
     '# 手工注释',
@@ -351,10 +352,10 @@ test('writeAgentFile：白名单内可写，白名单外拒绝', async () => {
   rmSync(home, { recursive: true, force: true })
 })
 
-test('archiveAgent：移动到备份目录，原目录消失、备份保留内容', () => {
+test('archiveAgent：移动到备份目录，原目录消失、备份保留内容', async () => {
   const { home, paths } = makeHome()
   const agent = createAgent(paths, { name: 'Y' })
-  const result = archiveAgent(paths, agent.id, new Date(2026, 8, 9, 10, 30, 5))
+  const result = await archiveAgent(paths, agent.id, new Date(2026, 8, 9, 10, 30, 5))
   assert.ok(result.archived.startsWith(paths.backupRoot))
   assert.ok(result.archived.endsWith(`${agent.id}-20260909-103005`))
   assert.ok(!existsSync(join(paths.companionsRoot, agent.id)))

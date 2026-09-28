@@ -97,20 +97,18 @@ window.__ModuleLoader__.load({
       '.cmd-thumb{background:var(--dsw-alias-label-primary-foreground,#fff);border-radius:50%;width:16px;height:16px;transition:transform .12s;display:block}',
       '.cmd-switch-on .cmd-thumb{transform:translate(16px)}',
       /*
-       * 输入框工具栏里的伙伴下拉。尺寸对齐官方那一带的紧凑控件：
-       * 小圆角、单行、12~13px 字号，不抢视觉焦点。
+       * 输入框工具栏里的伙伴下拉 trigger —— 逐条对齐官方权限下拉的
+       * PermissionSelect trigger 样式（dsh-client-ui-permission-presets 打包内联的
+       * .trigger/.triggerLabel/.chevron），只换类名前缀：
+       * 无边框、hover 用 interactive-bg-hover、13px/500 字重、4px 间距、箭头旋转。
+       * 浮层本体由官方 primitives 的 Menu 自带（含半透明材质与键盘导航），不再自绘。
        */
-      '.cmd-picker{position:relative;display:inline-flex;align-items:center}',
-      '.cmd-chip{font:inherit;font-size:12px;line-height:18px;cursor:pointer;background:transparent;color:var(--dsw-alias-label-secondary,#6b6b6b);border:.5px solid var(--dsw-alias-border-l3,#d9d9d9);border-radius:8px;padding:2px 8px;white-space:nowrap}',
-      '.cmd-chip:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5);color:var(--dsw-alias-label-primary,#1f1f1f)}',
-      '.cmd-chip[data-open="1"]{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5);color:var(--dsw-alias-label-primary,#1f1f1f)}',
-      '.cmd-chip:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4a7dff);outline-offset:1px}',
-      // 锁定态：不可点，只作为"本次对话在用哪个伙伴"的指示
-      '.cmd-chip-locked{cursor:default;border-color:transparent;background:transparent;color:var(--dsw-alias-label-tertiary,#8c8c8c);padding-left:2px}',
-      '.cmd-menu{position:absolute;bottom:calc(100% + 6px);left:0;z-index:20;min-width:150px;max-height:260px;overflow-y:auto;padding:4px;background:var(--dsw-alias-bg-layer-1,#fff);border:.5px solid var(--dsw-alias-border-l2,#e5e5e5);border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.12);display:flex;flex-direction:column;gap:1px}',
-      '.cmd-menu-item{font:inherit;font-size:13px;line-height:20px;text-align:left;cursor:pointer;background:transparent;border:0;border-radius:7px;padding:6px 10px;color:var(--dsw-alias-label-primary,#1f1f1f);white-space:nowrap}',
-      '.cmd-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5)}',
-      '.cmd-menu-item[data-on="1"]{background:var(--dsw-alias-interactive-bg-selected,#eef3ff);color:var(--dsw-alias-brand-primary,#4a7dff)}',
+      '.cmd-picker-trigger{font:inherit;font-size:13px;font-weight:500;line-height:20px;color:var(--dsw-alias-label-secondary,#6b6b6b);cursor:pointer;background:none;border:none;outline:none;display:inline-flex;align-items:center;gap:4px;padding:0 4px 0 8px;height:28px;min-width:0;max-width:220px;border-radius:var(--dsw-radius-sm,8px);white-space:nowrap}',
+      '.cmd-picker-trigger:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5)}',
+      '.cmd-picker-trigger:focus-visible{box-shadow:0 0 0 2px var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary,#4a7dff))}',
+      '.cmd-picker-label{text-overflow:ellipsis;white-space:nowrap;min-width:0;overflow:hidden}',
+      '.cmd-picker-chevron{color:var(--dsw-alias-label-caption,#9a9a9a);flex:none;transition:transform .12s;display:inline-flex}',
+      '.cmd-picker-chevron-open{transform:rotate(180deg)}',
       '.cmd-journal{display:flex;flex-direction:column;gap:6px;min-height:360px}',      '.cmd-journal-foot{margin-top:auto;padding-top:6px}',
       '.cmd-journal-row{display:flex;gap:12px;align-items:center;width:100%;box-sizing:border-box;text-align:left;font:inherit;color:inherit;background:transparent;cursor:pointer;padding:6px 10px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l2,#e5e5e5)}',
       '.cmd-journal-row:hover{background:var(--dsw-alias-interactive-bg-hover,#f5f5f5)}',
@@ -122,13 +120,21 @@ window.__ModuleLoader__.load({
       '.cmd-sep{height:1px;background:var(--dsw-alias-border-l2,#eee);margin:4px 0}',
       '.cmd-dialog{width:min(480px,100%)}',
       '.cmd-dialog-fields{display:flex;flex-direction:column;gap:12px}',
-      // 自建 Dialog 的定位与层级：原 Modal 自带这些，换成原生元素后必须自己补。
-      '.cmd-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--dsw-alias-bg-mask-drop,rgba(0,0,0,.45))}',
-      '.cmd-dialog-sheet{width:min(560px,100%);max-height:min(80vh,720px);box-sizing:border-box;display:flex;flex-direction:column;gap:10px;padding:16px 18px;border-radius:14px;border:.5px solid var(--dsw-alias-border-l2,#e5e5e5);background:var(--dsw-alias-bg-overlay,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);box-shadow:0 12px 40px rgba(0,0,0,.18)}',
+      // 自建兜底 Dialog 的定位与层级：原 Modal 自带这些，换成原生元素后必须自己补。
+      // 遮罩 token 必须用 --dsw-alias-bg-mask-1（模态遮罩：亮 #0000003d / 暗 #00000080）。
+      // 曾误用 --dsw-alias-bg-mask-drop —— 那是下拉浮层的遮罩，暗色主题值 #272730b3，
+      // 呈蓝灰色，就是「弹窗背景发蓝」事故的根源。
+      '.cmd-overlay{position:fixed;inset:0;z-index:1000;display:flex;align-items:center;justify-content:center;padding:24px;background:var(--dsw-alias-bg-mask-1,rgba(0,0,0,.45))}',
+      '.cmd-dialog-sheet{width:min(560px,100%);max-height:min(80vh,720px);box-sizing:border-box;display:flex;flex-direction:column;gap:10px;padding:16px 18px;border-radius:14px;border:.5px solid var(--dsw-alias-border-l2,#e5e5e5);background:var(--dsw-alias-bg-layer-2,#fff);color:var(--dsw-alias-label-primary,#1f1f1f);box-shadow:0 12px 40px rgba(0,0,0,.18)}',
       '.cmd-dialog-head{display:flex;flex-direction:column;gap:2px}',
       '.cmd-dialog-title{font-size:15px;font-weight:600;line-height:1.4;overflow-wrap:anywhere}',
       '.cmd-dialog-sub{font-size:11.5px;color:var(--dsw-alias-label-tertiary,#8c8c8c)}',
       '.cmd-dialog-foot{display:flex;justify-content:flex-end;gap:8px}',
+      // 危险确认弹窗：勾选行样式只在自建兜底时用到（官方 RiskConfirmation 自带）。
+      '.cmd-ack{display:flex;align-items:flex-start;gap:10px;margin-top:4px;font-size:14px;line-height:22px;color:var(--dsw-alias-label-primary,#1f1f1f);cursor:pointer}',
+      '.cmd-ack input{flex:none;width:16px;height:16px;margin:3px 0 0;accent-color:var(--dsw-alias-button-primary-fill,#4a7dff);cursor:pointer}',
+      '.cmd-confirm-text{display:flex;align-items:flex-start;gap:10px;margin:0;color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:14px;line-height:22px}',
+      '.cmd-confirm-warn{flex:none;margin-top:2px;color:var(--dsw-alias-state-error-primary,#c0392b)}',
     ].join('\n')
 
     function ensureStyles() {
@@ -141,11 +147,53 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 自建弹窗。
-     * 不用 @deepseek-ai/dsh-client-ui-primitives —— 该包在此 DSH 版本已不存在。
-     * 属性含义与原 Modal 对齐：title / description / footer / onClose / className。
+     * 官方 Modal（官方重命名会话弹窗同款）。取不到时为 null —— Dialog 退回自建实现。
+     * 官方 Modal 遮罩用 --dsw-alias-bg-mask-1（黑色半透明），与自建兜底一致；
+     * 自带 Escape 关闭、焦点圈定、右上角关闭钮（closeLabel 即其无障碍标签）。
      */
-    function Dialog({ open, onClose, title, description, footer, className, children }) {
+    function pickOfficialModal() {
+      try {
+        const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+        const Modal = primitives && primitives.Modal
+        return typeof Modal === 'function' ? Modal : null
+      } catch {
+        return null
+      }
+    }
+    const OfficialModal = pickOfficialModal()
+
+    /**
+     * 危险操作确认弹窗（官方权限预设「完整访问」确认同款）。取不到时为 null ——
+     * ConfirmDialog 退回自建勾选确认。
+     */
+    function pickOfficialRiskConfirmation() {
+      try {
+        const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+        const Risk = primitives && primitives.RiskConfirmation
+        return typeof Risk === 'function' ? Risk : null
+      } catch {
+        return null
+      }
+    }
+    const OfficialRiskConfirmation = pickOfficialRiskConfirmation()
+
+    /**
+     * 弹窗容器：官方 Modal 可用时直接委托（与官方弹窗同款视觉与交互），
+     * 取不到时退回自建实现。属性含义与官方 Modal 对齐：
+     * title / description / footer / onClose / className / closeLabel。
+     */
+    function Dialog({ open, onClose, title, description, footer, className, closeLabel, children }) {
+      if (OfficialModal) {
+        return h(OfficialModal, {
+          open,
+          onClose,
+          title,
+          description,
+          footer,
+          className,
+          closeLabel: closeLabel || '关闭',
+        }, children)
+      }
       if (!open) return null
       return h('div', {
         className: 'cmd-overlay',
@@ -168,10 +216,61 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * 危险确认弹窗（删除伙伴等）。官方 RiskConfirmation 是「Modal + 警告行 +
+     * 我已知晓勾选框 + 确认/取消」的组合，确认键在勾选前禁用；取不到时退回
+     * 同形态的自建实现（仍带勾选，不再退回 window.confirm）。
+     */
+    function ConfirmDialog({ open, title, warning, confirmLabel, cancelLabel, busy, onConfirm, onCancel }) {
+      const [acknowledged, setAcknowledged] = React.useState(false)
+      // 弹窗每次打开都从「未勾选」起步：上次会话的确认不能延续到下一次危险操作。
+      React.useEffect(() => { if (open) setAcknowledged(false) }, [open])
+      const footer = h(React.Fragment, null,
+        h('button', { type: 'button', className: 'cmd-btn', disabled: busy, onClick: onCancel }, cancelLabel || '取消'),
+        h('button', {
+          type: 'button', className: 'cmd-btn cmd-btn-primary',
+          disabled: busy || !acknowledged, onClick: onConfirm,
+        }, confirmLabel || '删除'))
+      if (OfficialRiskConfirmation) {
+        return h(OfficialRiskConfirmation, {
+          open,
+          title,
+          description: warning,
+          acknowledgeLabel: '我已了解影响，继续',
+          cancelLabel: cancelLabel || '取消',
+          closeLabel: '关闭',
+          confirmLabel: confirmLabel || '删除',
+          acknowledged,
+          onAcknowledgedChange: setAcknowledged,
+          disabled: busy,
+          onCancel,
+          onConfirm,
+        })
+      }
+      return h(Dialog, {
+        open, onClose: onCancel, title, className: 'cmd-dialog',
+        footer,
+      },
+        h('div', { className: 'cmd-confirm-text' },
+          h('span', { className: 'cmd-confirm-warn', 'aria-hidden': 'true' }, '⚠'),
+          h('p', null, warning)),
+        h('label', { className: 'cmd-ack' },
+          h('input', {
+            type: 'checkbox', checked: acknowledged, disabled: busy,
+            onChange: (event) => setAcknowledged(event.currentTarget.checked),
+          }),
+          h('span', null, '我已了解影响，继续')))
+    }
+
     /* ── 卡片底部三个图标 ──
      *
-     * 优先用官方 primitives 的同名图标（IconBrowseOutline16 / IconCopyOutline16 /
-     * IconTrashOutline16），与官方预设卡片视觉一致；取不到时退回内联 SVG。
+     * 优先用官方 primitives 的同名图标（IconBrowseOutlineRegular / IconCopyOutlineRegular /
+     * IconTrashOutlineRegular），与官方预设卡片视觉一致；取不到时退回内联 SVG。
+     *
+     * 图标名历史：0.1.5-rc.3 时代官方导出的是 *Outline16 尺寸后缀名；0.1.7-rc.2 起官方
+     * 删除了全部 *Outline16 导出，改用 *OutlineRegular / *OutlineMedium 粗细变体命名
+     * （官方 agent-preset 卡片自己也只用 IconBrowseOutlineRegular 等新名）。升级后探测
+     * 落空会静默退回自绘 SVG —— 伙伴卡片图标「变回手绘」即此症状，改探测名即愈。
      *
      * 为什么必须带兜底：历史上曾在 factory 顶层直接解构该包，包取不到导致 factory
      * 抛错 → apply 从不执行 → ensureStyles 不跑 → 整页裸 HTML（见
@@ -211,9 +310,24 @@ window.__ModuleLoader__.load({
       }
     }
 
-    const IconBrowse = pickOfficialIcon('IconBrowseOutline16') || SvgBrowse
-    const IconCopy = pickOfficialIcon('IconCopyOutline16') || SvgCopy
-    const IconTrash = pickOfficialIcon('IconTrashOutline16') || SvgTrash
+    const IconBrowse = pickOfficialIcon('IconBrowseOutlineRegular') || SvgBrowse
+    const IconCopy = pickOfficialIcon('IconCopyOutlineRegular') || SvgCopy
+    const IconTrash = pickOfficialIcon('IconTrashOutlineRegular') || SvgTrash
+
+    /**
+     * 官方 Menu 浮层组件（权限下拉同款）。取不到时为 null —— 调用点退回
+     * 仅 trigger 的静态展示，避免整个伙伴条目因缺组件而不渲染。
+     */
+    function pickOfficialMenu() {
+      try {
+        const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+        const Menu = primitives && primitives.Menu
+        return typeof Menu === 'function' ? Menu : null
+      } catch {
+        return null
+      }
+    }
+    const OfficialMenu = pickOfficialMenu()
 
     async function call(path, options) {
       const response = await fetch(`${API}${path}`, options)
@@ -420,6 +534,8 @@ window.__ModuleLoader__.load({
       const [copyError, setCopyError] = React.useState('')
       // 每张卡片的删除中状态：防止同一秒内双击导致备份目录重名
       const [deleting, setDeleting] = React.useState('')
+      // 待确认删除的伙伴：非 null 时渲染 ConfirmDialog（官方 RiskConfirmation 同款形态）
+      const [removeTarget, setRemoveTarget] = React.useState(null)
 
       const load = React.useCallback(() => {
         call('/agents').then((data) => setAgents(data.agents)).catch((error) => setMessage(String(error.message)))
@@ -440,10 +556,6 @@ window.__ModuleLoader__.load({
 
       const remove = async (agent) => {
         if (deleting) return
-        const ok = typeof window !== 'undefined' && window.confirm
-          ? window.confirm(`删除「${agent.name}」？\n\n只是移动到备份目录，不会真的删除；旧对话仍可查看，新会话不再出现。`)
-          : true
-        if (!ok) return
         setDeleting(agent.id)
         try {
           const data = await call(`/agents/${agent.id}`, { method: 'DELETE' })
@@ -453,6 +565,7 @@ window.__ModuleLoader__.load({
           setMessage(`删除失败：${error.message}`)
         } finally {
           setDeleting('')
+          setRemoveTarget(null)
         }
       }
 
@@ -544,9 +657,18 @@ window.__ModuleLoader__.load({
               title: '删除',
               disabled: deleting === agent.id,
               'aria-label': `删除：${agent.name}`,
-              onClick: () => remove(agent),
+              onClick: () => setRemoveTarget(agent),
             }, h(IconTrash)))))),
         copyDialog,
+        removeTarget ? h(ConfirmDialog, {
+          open: true,
+          title: `删除「${removeTarget.name}」`,
+          warning: '伙伴将移动到备份目录：旧对话仍可查看，新会话不再出现。绑定的会话与提示词注入随之解除。',
+          confirmLabel: '删除',
+          busy: deleting === removeTarget.id,
+          onConfirm: () => { void remove(removeTarget) },
+          onCancel: () => setRemoveTarget(null),
+        }) : null,
       )
     }
 
@@ -663,8 +785,10 @@ window.__ModuleLoader__.load({
         if (file === tab) return
         /*
          * 切页签前确认：未保存的编辑不能无声丢弃。
-         * 用 window.confirm（不用自建弹窗）：这是浏览器级的「你要放弃吗」，
-         * 与页面里那些增删改对话框不是一回事，不该共用视觉。
+         * 这里有意保留 window.confirm：拦截的是**同步流程中间**（函数内直接 return
+         * 即可取消切换），换 Promise 形态的弹窗要把 pickTab 拆成两段状态机，
+         * 且页签切换不是危险操作，浏览器级确认足够；页内危险操作（删除伙伴）
+         * 走 ConfirmDialog（官方 RiskConfirmation 同款），不在此处。
          */
         if (dirty && typeof window !== 'undefined' && !window.confirm(`${tab} 有未保存的改动，放弃并切换吗？`)) return
         setTab(file)
@@ -845,14 +969,25 @@ window.__ModuleLoader__.load({
       const useSession = props.useSession ?? noSession
       const session = useSession((snapshot) => snapshot)
       const presetId = useSessionPreset(props)
-      const [state, setState] = React.useState({ phase: 'loading', list: [], current: null, open: false })
+      const [state, setState] = React.useState({ phase: 'loading', list: [], current: null, open: false, error: '' })
       const locked = !canPickCompanion(session)
+      // W8：pick 失败提示的自动清除计时器。hook 必须在早 return 之前调用。
+      const pickErrorTimer = React.useRef(null)
 
-      // ── 显形闸门：仅「伙伴模式」预设 ──
-      // 放在所有 hook 之后（hook 次数必须恒定）；不显形时不发请求、不渲染。
-      if (presetId !== COMPANION_PRESET_ID) return null
-
+      /*
+       * ⚠️ 这个 effect 必须在显形闸门**之前**声明。
+       *
+       * 历史 bug：闸门 `if (presetId !== COMPANION_PRESET_ID) return null`
+       * 曾写在 effect 之前 —— 非伙伴会话首次渲染早 return（少调一个 hook），
+       * 用户随后把预设切成伙伴模式、投影更新后重渲染，hook 数从 3 变 4，
+       * React 抛 "Rendered more hooks than during the previous render"，
+       * 被官方 SlotErrorBoundary 捕获后整个 slot 条目被 abdicate 摘除 ——
+       * 表现为「hero 已显示伙伴模式、伙伴下拉却永远不出现」，console 之外无任何提示。
+       * 规则：早 return 只能放在**全部** hook 之后；「不显形不发请求」改由
+       * effect 体内的闸门保证。
+       */
       React.useEffect(() => {
+        if (presetId !== COMPANION_PRESET_ID) return
         let alive = true
         /*
          * 路径是 `/companions`，**不是** `/api/companions`。
@@ -872,17 +1007,46 @@ window.__ModuleLoader__.load({
             if (alive) setState((prev) => ({ ...prev, phase: 'error' }))
           })
         return () => { alive = false }
-      }, [sessionId])
+        /*
+         * ⚠️ 依赖必须含 presetId。
+         *
+         * 历史 bug：依赖曾只有 [sessionId] —— 会话原地从标准切到伙伴模式时
+         * sessionId 不变，effect 不重跑，phase 卡在 'loading' → 永远 return null。
+         * 表现为「切预设不显示，点去别的会话再点回来才显示」（换会话触发
+         * session-scope 条目重挂载，替 effect 补跑了一次）。把 presetId 放进
+         * 依赖后，预设一到位就重新拉取；切走再切回多一次无害的重复请求。
+         */
+      }, [sessionId, presetId])
 
       async function pick(id) {
         setState((prev) => ({ ...prev, open: false }))
         try {
           const payload = await call('/companion', json('PUT', { companion: id, session: sessionId }))
-          setState((prev) => ({ ...prev, current: payload.current ?? null }))
+          setState((prev) => ({ ...prev, current: payload.current ?? null, error: '' }))
         } catch (error) {
-          setState((prev) => ({ ...prev, error: String(error && error.message ? error.message : error) }))
+          /*
+           * W8：失败必须看得见。这个下拉挂在输入栏，没有别的状态区可借，
+           * 所以把错误短暂顶掉触发器文字（红色），5 秒后自动还原——
+           * 静默失败会让用户以为选上了，实际系统提示词根本没换。
+           */
+          const message = String(error && error.message ? error.message : error)
+          if (pickErrorTimer.current) clearTimeout(pickErrorTimer.current)
+          pickErrorTimer.current = setTimeout(() => {
+            pickErrorTimer.current = null
+            setState((prev) => ({ ...prev, error: '' }))
+          }, 5000)
+          setState((prev) => ({ ...prev, error: message }))
         }
       }
+
+      const showError = typeof state.error === 'string' && state.error !== ''
+
+      /*
+       * ── 显形闸门：仅「伙伴模式」预设 ──
+       * 必须位于所有 hook（useState / useEffect）之后 —— 见上方 effect 前的说明。
+       * 不显形时连 phase='loading' 的分支都不该走到，直接整体不渲染。
+       */
+      if (presetId !== COMPANION_PRESET_ID) return null
 
       if (state.phase === 'loading') return null
       if (state.phase === 'error') return null
@@ -891,39 +1055,56 @@ window.__ModuleLoader__.load({
 
       const currentName = state.current
         ? ((state.list.find((item) => item.id === state.current) || {}).name || state.current)
-        : '无伙伴'
+        : '无'
 
       if (locked) {
-        // 锁定后只读展示：开对话后绑定不可改（用户明确要求）
-        return h('span', { className: 'cmd-chip cmd-chip-locked', title: '本次对话已开始，伙伴不可更改' }, currentName)
+        // 锁定后只读展示：开对话后绑定不可改（用户明确要求）。
+        // 锁定态不可能是 pick 失败的来源（锁定时下拉本就不可交互），不需要 error 分支。
+        return h('span', { className: 'cmd-picker-trigger', title: '本次对话已开始，伙伴不可更改' }, `伙伴：${currentName}`)
       }
 
-      return h('div', { className: 'cmd-picker' },
-        h('button', {
+      // W8：选伙伴失败（如 409 / 网络错误）——红色短暂顶掉触发器文字，5 秒后还原。
+      if (showError) {
+        return h('span', {
+          className: 'cmd-picker-trigger cmd-err',
+          title: state.error,
+          onClick: () => setState((prev) => ({ ...prev, error: '', open: false })),
+        }, `伙伴选择失败：${state.error}`)
+      }
+
+      /*
+       * 样式对齐官方权限下拉（dsh-client-ui-permission-presets 的 PermissionSelect）：
+       * - 用官方 primitives 的 Menu（浮层/键盘导航/选中勾全由官方管）；
+       * - trigger 是"文字 + 旋转箭头"的无边框内联控件，与权限下拉同排同观感；
+       * - 菜单项就是伙伴名，不加"（用官方提示词）"之类的行为说明 —— 选择即生效，
+       *   无伙伴 = 会话不注册任何 persona section，官方提示词原样生效（见 host 半）。
+       */
+      const items = [
+        { id: '__none__', label: '无' },
+        ...state.list.map((item) => ({ id: item.id, label: item.name || item.id })),
+      ]
+      const currentValue = state.current ?? '__none__'
+      if (!OfficialMenu) {
+        // 官方 Menu 缺席（极旧版 dsh）：退化为只读文字，至少占位可见。
+        return h('span', { className: 'cmd-picker-trigger' }, `伙伴：${currentName}`)
+      }
+      return h(OfficialMenu, {
+        open: state.open,
+        items,
+        selectedId: currentValue,
+        onSelect: (id) => { setState((prev) => ({ ...prev, open: false })); pick(id === '__none__' ? null : id) },
+        onClose: () => setState((prev) => ({ ...prev, open: false })),
+        side: 'top',
+        portal: true,
+        anchor: h('button', {
           type: 'button',
-          className: 'cmd-chip',
-          'data-open': state.open ? '1' : '0',
+          className: 'cmd-picker-trigger',
           onClick: () => setState((prev) => ({ ...prev, open: !prev.open })),
-        }, `${currentName} ▾`),
-        state.open
-          ? h('div', { className: 'cmd-menu' },
-            h('button', {
-              key: '__none__',
-              type: 'button',
-              className: 'cmd-menu-item',
-              'data-on': state.current ? '0' : '1',
-              onClick: () => pick(null),
-            }, '无伙伴（用官方提示词）'),
-            state.list.map((item) => h('button', {
-              key: item.id,
-              type: 'button',
-              className: 'cmd-menu-item',
-              'data-on': item.id === state.current ? '1' : '0',
-              onClick: () => pick(item.id),
-            }, item.name || item.id)))
-          : null,
-        state.error ? h('span', { className: 'cmd-err' }, state.error) : null,
-      )
+        },
+          h('span', { className: 'cmd-picker-label' }, `伙伴：${currentName}`),
+          h('span', { className: `cmd-picker-chevron${state.open ? ' cmd-picker-chevron-open' : ''}`, 'aria-hidden': true }, '▾'),
+        ),
+      })
     }
 
     /* ────────────────────────── 入口 ────────────────────────── */

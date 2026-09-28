@@ -63,8 +63,14 @@ async function withServer() {
      * 真正的 per-agent scope 是 `agent.ctx`。所以这个桩按真实形态只挂一个
      * filter 符号 —— 谁要是又去 `this.systemPrompt`，这里就会立刻炸出来。
      */
-    emit(event, payload, scopeCtx) {
-      for (const handler of listeners.get(event) ?? []) handler.call(scopeCtx, payload)
+    /*
+     * emit 支持多参透传：官方 registry 广播预设切换时的签名是
+     * `ctx.emit('agent-preset/selected', sessionId, presetId)`（两个业务参数），
+     * 单参的 payload 形态覆盖不了它。scopeCtx 仍作为 this（最后一个参）。
+     */
+    emit(event, ...args) {
+      const scopeCtx = args.length > 1 && typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null && !Array.isArray(args[args.length - 1]) ? args.pop() : undefined
+      for (const handler of listeners.get(event) ?? []) handler.call(scopeCtx, ...args)
     },
     webServer: {
       register: (route) => {
@@ -761,6 +767,11 @@ test('回归：取不到 agent.ctx 时不静默 —— 记 warn 且不写坏状�
   /*
    * 万一将来官方改了 agent 的形状、`agent.ctx` 拿不到，
    * 必须留下日志线索，而不是像上次那样"看起来一切正常"。
+   *
+   * ⚠️ session 必须带 header.agentPreset：会话身份的判据是「先认出这是伙伴模式
+   * 会话」（事件流无 agent-preset/selected 时回落到 header），识别不出就直接
+   * 返回、根本走不到下面那条 agent.ctx 的告警。真实会话一定带 header，
+   * 不带 header 的桩属于不存在的形态。
    */
   const { call, close, ctx, warns } = await withServer()
   try {
@@ -769,7 +780,13 @@ test('回归：取不到 agent.ctx 时不静默 —— 记 warn 且不写坏状�
 
     // 有绑定事件但 agent 没有 ctx：应在 agent/created 阶段就报出线索
     const events = [{ type: 'companion/selected', data: { companion: id } }]
-    const session = { id: 's1', blank: true, append: () => {}, ownEvents: () => events }
+    const session = {
+      id: 's1',
+      blank: true,
+      header: { agentPreset: 'companion-mode' },
+      append: () => {},
+      ownEvents: () => events,
+    }
     ctx.emit('agent/created', { agent: { session } }, scopeCarrierStub())
 
     assert.ok(
@@ -816,6 +833,94 @@ test('回归：伙伴绑定绝不写进会话事件流（会让会话打不开�
     assert.equal(response.status, 200)
     assert.equal(appendCalled, false, 'session.append 不得被调用——写进事件流会让会话无法打开')
     assert.equal(readBindings(resolvePaths(home))['s1'], id, '应写入绑定表')
+  } finally {
+    close()
+  }
+})
+
+test('预设切走：agent-preset/selected 广播非伙伴模式时撤注入并清绑定', async () => {
+  /*
+   * 回归：用户在伙伴模式会话里选了莉莉，再把预设切成标准模式 ——
+   * 官方 select 只换工具集，不会通知我们撤人设。不处理就成了
+   * "标准模式的全套工具 + 莉莉的人设"（实测事故：会话跑的是 standard 的
+   * 工具集，系统提示词却是莉莉的 persona）。
+   *
+   * 修复后：host 监听官方广播（dsh-agent-preset-registry/lib/index.js:489，
+   * 签名 `(sessionId, presetId)`），切走即撤注入 + 清绑定。
+   */
+  const { home, call, close, ctx } = await withServer()
+  try {
+    const created = await call('/agents', { method: 'POST', body: { name: '莉莉' } })
+    const id = created.json.agent.id
+
+    const disposed = []
+    const registered = { sections: [], variables: [] }
+    const agentCtx = {
+      systemPrompt: {
+        section: (section) => { registered.sections.push(section); return () => disposed.push(section.name) },
+        variable: (name) => { registered.variables.push(name); return () => disposed.push(name) },
+      },
+    }
+    const session = { id: 's1', blank: true, append: () => {} }
+    ctx.emit('agent/created', { agent: { session, ctx: agentCtx } }, scopeCarrierStub())
+
+    const response = await call('/companion', { method: 'PUT', body: { companion: id, session: 's1' } })
+    assert.equal(response.status, 200)
+    assert.equal(registered.sections.filter((s) => s.complete === true).length, 1, '前置：绑定已装上注入')
+
+    // 官方广播：该会话切到了 standard
+    ctx.emit('agent-preset/selected', 's1', 'standard')
+
+    assert.ok(disposed.length > 0, '切走后应撤掉 persona section/变量')
+    // 清绑定是异步的（共用按路径写队列），监听器里 fire-and-forget：等队列跑完
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(readBindings(resolvePaths(home))['s1'], undefined, '切走后应清掉残留绑定')
+  } finally {
+    close()
+  }
+})
+
+test('预设恢复会话：事件流显示已切到其他预设时，不再按残留绑定装人设', async () => {
+  /*
+   * 另一半路径：切走时绑定若因故没清干净（旧版本数据、崩溃残留），
+   * 恢复会话时 agent/created 也不能把伙伴人设装到非伙伴模式的会话上。
+   * 判据 = 事件流里最后一条 agent-preset/selected。
+   */
+  const { home, call, close, ctx } = await withServer()
+  try {
+    const created = await call('/agents', { method: 'POST', body: { name: '莉莉' } })
+    const id = created.json.agent.id
+
+    // 先造一个绑定（走正道）
+    const session = { id: 's1', blank: true, append: () => {} }
+    ctx.emit('agent/created', { agent: { session } }, scopeCarrierStub())
+    await call('/companion', { method: 'PUT', body: { companion: id, session: 's1' } })
+    assert.ok(readBindings(resolvePaths(home))['s1'], '前置：绑定已写入')
+
+    // 模拟"会话事件流里已有切档记录"的恢复场景：事件流最后一条是 standard
+    const events = [{ type: 'agent-preset/selected', data: { agentPreset: 'standard' } }]
+    const registered = { sections: [], variables: [] }
+    const agentCtx = {
+      systemPrompt: {
+        section: (section) => { registered.sections.push(section); return () => {} },
+        variable: (name) => { registered.variables.push(name); return () => {} },
+      },
+    }
+    const resumed = {
+      id: 's1',
+      blank: true,
+      append: () => {},
+      ownEvents: () => events,
+    }
+    ctx.emit('agent/created', { agent: { session: resumed, ctx: agentCtx } }, scopeCarrierStub())
+
+    assert.deepEqual(
+      registered.sections.filter((s) => s.complete === true),
+      [],
+      '非伙伴模式的会话不得装伙伴人设',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    assert.equal(readBindings(resolvePaths(home))['s1'], undefined, '恢复时应顺带清掉残留绑定')
   } finally {
     close()
   }

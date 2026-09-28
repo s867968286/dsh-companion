@@ -274,7 +274,7 @@ test('端到端：MD 正文里的花括号不会被官方插值解析（走真�
   /*
    * 这是**协议依赖型安全**，必须用真实渲染链路锁住，不能只测 substitutePlaceholders。
    *
-   * 机制：section 的 text 只有 `{{preset_md}}` 一个占位符，MD 正文全在**变量右值**里；
+   * 机制：section 的 text 只有 `{{companion_persona}}` 一个占位符，MD 正文全在**变量右值**里；
    * 官方 `interpolate()` 明确「替换值不再被扫描」（源码注释
    * "substituted values are not scanned again"），所以正文里的 `{{…}}` 原样保留。
    *

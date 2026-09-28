@@ -1,4 +1,4 @@
-# dsh-preset-md
+# dsh-companion
 
 > 给 DSH 助手赋予**人格、灵魂与长期记忆**——用 Markdown 定义伙伴的身份、性格、准则与记忆，
 > 自动写日记、自动更新记忆，并在官方设置页里可视化管理。
@@ -42,7 +42,7 @@
 ## 文件约定
 
 ```
-<dshHome>/preset-md/companions/<id>/
+<dshHome>/companion/companions/<id>/
 ├── preset.yml           ← 昵称与个性签名
 ├── SYSTEM.md            ┐
 ├── SOUL.md              │
@@ -89,7 +89,7 @@
 
 ```sh
 # 装进某个 profile（推荐：可用完整的「伙伴设置」页面）
-dsh plugin --profile <profile> add github:s867968286/dsh-preset-md
+dsh plugin --profile <profile> add github:s867968286/dsh-companion
 ```
 
 装完**重启 dsh**：bundle 不热重载，已挂载的组合不会热替换模块。
@@ -97,7 +97,7 @@ dsh plugin --profile <profile> add github:s867968286/dsh-preset-md
 本地开发时改用 link：
 
 ```sh
-dsh plugin --profile <profile> add link:/绝对路径/dsh-preset-md
+dsh plugin --profile <profile> add link:/绝对路径/dsh-companion
 ```
 
 也可以不安装，直接在 preset 里用绝对路径引用 preset 行入口，此时只有提示词注入与自动记忆，没有设置页。
@@ -105,12 +105,12 @@ dsh plugin --profile <profile> add link:/绝对路径/dsh-preset-md
 在目标 preset 的 `agent.cordis.yml` 里加一行：
 
 ```yaml
-- id: preset-md
-  name: dsh-preset-md/preset
+- id: companion
+  name: dsh-companion/preset
 ```
 
 > **注意（0.1.7-rc.2 起）**：这条路只在"伙伴即 preset 目录"的老用法下有意义。
-> 正常的伙伴选择走**下拉**，伙伴数据在 `<dshHome>/preset-md/companions/`，
+> 正常的伙伴选择走**下拉**，伙伴数据在 `<dshHome>/companion/companions/`，
 > 与 preset 组合无关。上面这一行是**回落路径**：取不到会话绑定、也没有下拉可用时，
 > 插件才回落到 `ctx.baseUrl`（即 `agent.cordis.yml` 所在目录）读 MD。
 > 两者都取不到时注入为空并打一条 warn。
@@ -132,8 +132,8 @@ agent 能看到的工具 = 全局层（profile 里装的插件）＋ preset 层�
 「preset 没挂某个插件」并不会让它的工具消失，要收窄得显式声明：
 
 ```yaml
-- id: preset-md
-  name: dsh-preset-md/preset
+- id: companion
+  name: dsh-companion/preset
   config:
     tools:
       deny:
@@ -215,7 +215,7 @@ provider/model），而不是全局默认模型——否则会话换过模型后
 
 **失败要看得见**：回顾在后台跑，日志只进 dsh 进程的 stdout，默认看不到。所以
 「触发条件已满足、但没能写入」时（拿不到模型、调用异常、输出解析失败、模型没产出日志段落），
-除了打 warn，还会**往对话里注入一条 `[preset-md]` 提示**，说明是「已触发但失败」并带上原因。
+除了打 warn，还会**往对话里注入一条 `[companion]` 提示**，说明是「已触发但失败」并带上原因。
 同一条会话的这类提示有 60 秒节流，不会刷屏；「对话太短」这类正常跳过只记日志、不打扰用户。
 
 **写回来的换行风格**：MD 文件若是 CRLF（Windows 编辑器保存过），改动后仍保持 CRLF，
@@ -240,27 +240,27 @@ provider/model），而不是全局默认模型——否则会话换过模型后
 启动时会打一条 info 日志，形如：
 
 ```
-[preset-md] 注入体积 6031 字符 ≈ 2866 token，预算 20000（占 30%）| SYSTEM 533(9%) SOUL 1583(26%) ...
+[companion] 注入体积 6031 字符 ≈ 2866 token，预算 20000（占 30%）| SYSTEM 533(9%) SOUL 1583(26%) ...
 ```
 
-> 预算只管六个 MD。三个 `preset_md_*` 工具 schema 另占约 700 token，不含在内。
+> 预算只管六个 MD。三个 `companion_*` 工具 schema 另占约 700 token，不含在内。
 
-**记忆工具**：注册三个 `preset_md_` 前缀工具，覆盖「读日志 / 写日志 / 更新记忆」。
+**记忆工具**：注册三个 `companion_` 前缀工具，覆盖「读日志 / 写日志 / 更新记忆」。
 
 | 工具 | 用途 |
 |---|---|
-| `preset_md_search` | 只读：检索历史日志 |
-| `preset_md_journal` | 写入：把一段正文追加进当天日志（自动补日期头与时间标题） |
-| `preset_md_memory` | 写入：条目级更新 `IDENTITY.md` / `SOUL.md` / `USER.md` / `MEMORY.md` |
+| `companion_search` | 只读：检索历史日志 |
+| `companion_journal` | 写入：把一段正文追加进当天日志（自动补日期头与时间标题） |
+| `companion_memory` | 写入：条目级更新 `IDENTITY.md` / `SOUL.md` / `USER.md` / `MEMORY.md` |
 
-`preset_md_search` 参数：
+`companion_search` 参数：
 
 | 参数 | 行为 |
 |---|---|
 | `days` | 最多回溯几个**有内容**的日志文件（不是自然日），默认 7 |
 | `query` | 全文逐行匹配，返回 `日期:行号` 与上下文；不填则返回日志索引（每段时间标题 + 摘要行，超长截断补 `…`） |
 
-`preset_md_memory` 参数：`file`（白名单枚举）、`op`（`add` / `replace` / `remove`）、`content`、`old_text`。
+`companion_memory` 参数：`file`（白名单枚举）、`op`（`add` / `replace` / `remove`）、`content`、`old_text`。
 `replace` / `remove` 的 `old_text` 必须逐字来自原文且全文唯一，否则被拒绝并提示先读文件。
 
 > **为什么不直接用 `write` / `edit` 直写文件**：后台自动记忆走 `memory-store` 的按路径写队列
@@ -284,8 +284,8 @@ provider/model），而不是全局默认模型——否则会话换过模型后
 | 编辑 Markdown | 每个文件一个页签，纯文本编辑（不引 Markdown 渲染库）。无改动时保存按钮禁用；**切换页签前若有未保存改动会先确认** |
 | 新建伙伴 | 用内置模板生成 6 个 Markdown + `preset.yml` + `memory/`（**不生成 bundle 声明**——所以无需装包、无需重启） |
 | 复制伙伴 | 克隆内容与组合，不带历史日志 |
-| 删除 | 只移动到备份目录，不真删；新会话选不到，旧对话仍可查看 |
-| 参数 | 存 `<dshHome>/preset-md/settings.json`；改完点「保存」提交。**自动记忆与阈值实时生效**（下一个回合就按新值走，不必重启或重开会话） |
+| 删除 | 只移动到备份目录，不真删；新会话选不到，旧对话仍可查看。同时清掉所有指向该伙伴的会话绑定（否则重开那些会话会挂着一条指向已删目录的坏绑定） |
+| 参数 | 存 `<dshHome>/companion/settings.json`；改完点「保存」提交。**自动记忆与阈值实时生效**（下一个回合就按新值走，不必重启或重开会话） |
 
 > 参数表单是**攒草稿、点保存才提交**（与 `dsh-memory-md` 一致）：改到一半不会生效，
 > 有未保存改动时按钮上方会显示提示。数字项**留空即用默认值**（提交 `null`，由服务端
@@ -301,13 +301,13 @@ provider/model），而不是全局默认模型——否则会话换过模型后
 ## 目录结构
 
 ```
-├── src/index.js          主入口（Host 半）：/preset-md/api/* 与文件读写
+├── src/index.js          主入口（Host 半）：/companion/api/* 与文件读写
 ├── src/preset.js         preset 行（子路径 ./preset）：提示词注入 + 自动记忆
 ├── src/core.js           纯逻辑：目录解析、变量与 section 注册、会话冻结、工具收窄
 ├── src/memory-store.mjs  日志追加 / 条目级更新 / changelog
 ├── src/review.mjs        回顾提示词 + 模型调用 + 结果解析
-├── src/search.mjs        preset_md_search 工具
-├── src/tools.mjs         preset_md_journal / preset_md_memory 工具
+├── src/search.mjs        companion_search 工具
+├── src/tools.mjs         companion_journal / companion_memory 工具
 ├── src/settings.mjs      设置读写
 ├── src/templates.mjs     模板装载
 ├── templates/*.tpl       新建伙伴时写入的内置模板
@@ -329,10 +329,10 @@ npm run check     # 语法检查
 
 > **0.1.7-rc.2 的破坏性变更**：会话格式升到 v4 后，`Message.source` 里
 > `plugin` 这个兜底 kind 被**退役**了（官方注释：there is no shared catch-all `plugin` kind）。
-> 新事件若写 `{ kind: 'plugin', plugin: 'dsh-preset-md' }`，官方准入函数
+> 新事件若写 `{ kind: 'plugin', plugin: 'dsh-companion' }`，官方准入函数
 > `assertV4MessageSources` / `assertV4RowAdmission` 会硬抛
 > `SessionFormatError: format v4 message requires a producer-owned source kind`。
-> 本插件改用**生产者自有 kind** `plugin:dsh-preset-md`（与官方迁移器给未知第三方
+> 本插件改用**生产者自有 kind** `plugin:dsh-companion`（与官方迁移器给未知第三方
 > 生产者的命名一致）。旧会话里已落盘的 `plugin` 只在**读历史**时由迁移器改写，
 > 新写入不受这层照顾，所以必须改调用点。有两条回归测试直接用官方真包的准入函数锁住这一点。
 
@@ -354,7 +354,7 @@ npm run check     # 语法检查
 |---|---|---|
 | 新建伙伴 | 生成 bundle → 装进 profile → **重启 dsh** | 写几个文件，**即插即用** |
 | 出现在官方预设选择器 | ✅ | ❌（在对话工具栏选） |
-| 会话级绑定 | 靠官方 `agentPreset` | 写会话事件 `preset-md/companion-selected` |
+| 会话级绑定 | 靠官方 `agentPreset` | 插件自己的 `bindings.json`（按 sessionId 索引；历史上的事件流写法已废弃——v4 门禁会拒绝未知事件类型，见「开发」一节） |
 | 独占提示词 | ✅ `complete` | ✅ `complete`（同） |
 | 每个伙伴独立人设/记忆 | ✅ | ✅ |
 
@@ -373,10 +373,12 @@ npm run check     # 语法检查
 | 改插件代码要重启 dsh | 已挂载的组合不会热替换模块 |
 | **伙伴增删不用重启** | 伙伴是插件自己的数据；新建/删除后刷新页面即可在下拉里看到 |
 | 官方 `context` 不受影响 | 独占只替换 **section**；沙箱策略、审批策略等运行期快照照常注入 |
-| `preset.yml` 只动三个键 | 昵称/签名写入时只替换 `name` / `description` / `order` 三行，**注释与其余字段原样保留**（官方 `dsh-agent-presets` 也读这个文件）。昵称不写进 `agent.cordis.yml`——那里只是插件行清单 |
+| `preset.yml` 只动三个键 | 昵称/签名写入时只替换 `name` / `description` / `order` 三行，**注释与其余字段原样保留**（用户可能手工加注释或加本项目不读的键）。昵称不写进 `agent.cordis.yml`——那里只是插件行清单 |
 | 设置页写入带冲突检测 | 保存 Markdown 时回传载入时的版本指纹；若后台自动记忆期间改过同一文件，服务端回 **409** 并提示重新载入，不会静默覆盖那条记忆 |
-| 本机 HTTP 接口有来源校验 | `/preset-md/api/*` 的写请求（POST/PUT/DELETE）校验 `Sec-Fetch-Site` 与 `Origin`，跨站一律 403；非浏览器客户端（curl 等）不受影响 |
+| 本机 HTTP 接口有来源校验 | `/companion/api/*` 的写请求（POST/PUT/DELETE）校验 `Sec-Fetch-Site` 与 `Origin`，跨站一律 403；非浏览器客户端（curl 等）不受影响 |
 | 昵称 / 签名有长度上限 | 昵称 ≤ 60 字符、签名 ≤ 200 字符，超限报 400 |
+| **关窗口/重启后重开历史会话，伙伴会自己回来** | 绑定住在 `bindings.json`，**不随会话销毁清除**。重开一个历史会话时按「① 会话是不是伙伴模式 → ② 绑定表里是哪个伙伴」两级恢复人设。绑定只在两种情况下被清：会话被切到别的预设、或该伙伴被删除。绑定表因此会随用过的会话数增长（每行只是一个会话 id + 伙伴 id） |
+| 恢复判据 | ① 从会话事件流读 `agentPreset`（最后一条 `agent-preset/selected`，没有则用创建记录里的 header），**只用来判断"这是不是伙伴模式会话"**；② 伙伴身份查 `bindings.json`，查不到再兼容历史上的 `companion/selected` 事件。两级都拿不到就判为无效会话、**不注入**——识别不出预设时同样不注入（宁可少注入，不可把官方提示词顶掉） |
 
 
 ## 关键词

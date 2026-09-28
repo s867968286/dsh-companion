@@ -93,7 +93,11 @@ test('伙伴模式：host 半 inject 含 agentPresets 并完成注册', async ()
   const home = mkdtempSync(join(tmpdir(), 'companion-preset-'))
   mod.apply(ctx, { dshHome: home })
 
-  assert.deepEqual(injected, [['agentPresets']], '应通过 ctx.inject 等待 agentPresets')
+  assert.deepEqual(
+    injected,
+    [['agentPresets'], ['sessionQuery']],
+    '应通过 ctx.inject 等待 agentPresets（注册预设）与 sessionQuery（孤儿绑定清理，取不到就跳过）',
+  )
   assert.equal(calls.length, 1, '应恰好注册一个预设')
   assert.equal(calls[0].id, COMPANION_PRESET_ID)
   assert.ok(Array.isArray(calls[0].plugins) && calls[0].plugins.length > 0, 'plugins 应为非空行数组')

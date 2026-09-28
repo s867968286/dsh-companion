@@ -9,13 +9,27 @@
  * 2. **留痕**：`applyUpdate` 会先写 changelog 再原子写文件；直写没有 changelog。
  * 3. **校验**：`applyOp` 会拒绝找不到或出现多次的 `old_text`；直写不做任何校验。
  *
- * 工具名带 `preset_md_` 前缀，避免与官方/第三方工具冲突。
+ * 工具名带 `companion_` 前缀，避免与官方/第三方工具冲突。
  */
 import { EDITABLE_FILES, appendJournal, applyUpdate } from './memory-store.mjs'
 
 /** 模型可见的工具名。 */
-export const JOURNAL_TOOL_NAME = 'preset_md_journal'
-export const MEMORY_TOOL_NAME = 'preset_md_memory'
+export const JOURNAL_TOOL_NAME = 'companion_journal'
+export const MEMORY_TOOL_NAME = 'companion_memory'
+
+/**
+ * 归一化「目录或取目录函数」。
+ *
+ * 传函数时，目录在**每次 execute 时**现取（W2）：工具按 preset 行注册、
+ * 多个会话共享一份定义，而「这个会话绑了哪个伙伴」是会话级状态——
+ * 注册时固化的目录会让 blank 窗口内后选伙伴的会话写错地方。
+ * 执行期官方会把 `exec.agent` 传进 execute（dsh-agent-loop executeToolCalls），
+ * 调用方可用它解析当前会话的绑定。
+ */
+function resolveDir(dirOrFn, exec) {
+  const resolved = typeof dirOrFn === 'function' ? dirOrFn(exec?.agent) : dirOrFn
+  return typeof resolved === 'string' ? resolved : ''
+}
 
 /** 统一的输出 schema / 渲染（工具返回纯文本，供模型阅读）。 */
 const textOutput = {
@@ -29,8 +43,8 @@ const textOutput = {
 }
 
 /**
- * 构造 `preset_md_journal`：把一段内容追加进当天日志。
- * @param {string} dir - preset 目录
+ * 构造 `companion_journal`：把一段内容追加进当天日志。
+ * @param {string|((agent?: object) => string)} dir - 伙伴目录，或返回目录的函数（execute 时现取）
  */
 export function createJournalTool(dir) {
   return {
@@ -53,10 +67,10 @@ export function createJournalTool(dir) {
       required: ['body'],
     },
     output: textOutput,
-    async execute(args) {
+    async execute(args, exec) {
       const body = typeof args?.body === 'string' ? args.body : ''
       if (!body.trim()) return { text: '写入失败：body 为空，没有内容可写。' }
-      const result = await appendJournal(dir, body)
+      const result = await appendJournal(resolveDir(dir, exec), body)
       if (!result.ok) return { text: `写入日志失败：${result.error}` }
       return { text: `已写入今天（${result.key}）的记忆日志。` }
     },
@@ -64,8 +78,8 @@ export function createJournalTool(dir) {
 }
 
 /**
- * 构造 `preset_md_memory`：条目级更新长期记忆类 MD 文件。
- * @param {string} dir - preset 目录
+ * 构造 `companion_memory`：条目级更新长期记忆类 MD 文件。
+ * @param {string|((agent?: object) => string)} dir - 伙伴目录，或返回目录的函数（execute 时现取）
  */
 export function createMemoryTool(dir) {
   return {
@@ -99,7 +113,7 @@ export function createMemoryTool(dir) {
       required: ['file', 'op'],
     },
     output: textOutput,
-    async execute(args) {
+    async execute(args, exec) {
       const file = typeof args?.file === 'string' ? args.file.trim() : ''
       const op = typeof args?.op === 'string' ? args.op.trim() : ''
       const content = typeof args?.content === 'string' ? args.content : ''
@@ -116,7 +130,7 @@ export function createMemoryTool(dir) {
       if (op === 'replace' && !content.trim()) return { text: '写入失败：op=replace 需要非空的 content。' }
       if (op === 'remove' && !oldText.trim()) return { text: '写入失败：op=remove 需要 old_text。' }
 
-      const result = await applyUpdate(dir, file, op, content, oldText)
+      const result = await applyUpdate(resolveDir(dir, exec), file, op, content, oldText)
       if (!result.ok) {
         const hint = /出现多次|未在文件中找到/.test(result.error)
           ? '（请先读取该文件，取一段逐字且唯一的原文）'

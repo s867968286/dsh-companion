@@ -15,7 +15,9 @@
 # 想把它当编码 agent 用时，从官方 standard preset 拷回所需的行即可。
 #
 # 注意：带 `isolate` 的行必须保持 `cordis:group` 结构，不能平铺成顶层行，
-# 否则服务会发布到 root realm，`dsh-agent-presets` 在挂载时直接拒绝。
+# 否则服务会发布到 root realm，挂载时被直接拒绝
+# （`dsh-agent-preset-registry/lib/index.js:273`：
+#  `Preset services require isolate realms: …`）。
 
 # ── 提示词注入与自动记忆（dsh-companion） ──
 - id: companion

@@ -6,12 +6,12 @@
  * - 不带 query 时返回最近几天的「索引」（每段 `## HH:MM` + 首行）。
  *   首行取该段第一个非标题行——约定日志正文以「> 摘要：…」开头，所以索引展示的就是摘要。
  *
- * 工具名带 `preset_md_` 前缀，避免与官方/第三方工具冲突。
+ * 工具名带 `companion_` 前缀，避免与官方/第三方工具冲突。
  */
 import { listJournalFiles, readText } from './memory-store.mjs'
 
 /** 模型可见的工具名。 */
-export const SEARCH_TOOL_NAME = 'preset_md_search'
+export const SEARCH_TOOL_NAME = 'companion_search'
 
 /** 单次最多返回的命中片段数。 */
 export const MAX_HITS = 30
@@ -71,7 +71,7 @@ export function searchJournal(dir, query, days = 7) {
     : `（最近 ${span} 个日志文件里没有匹配「${keyword}」的内容）`
 }
 
-/** 构造 `preset_md_search` 的工具定义（parameters 为标准 JSON Schema 形态）。 */
+/** 构造 `companion_search` 的工具定义（parameters 为标准 JSON Schema 形态）。 */
 export function createSearchTool(dir) {
   return {
     name: SEARCH_TOOL_NAME,
@@ -99,8 +99,10 @@ export function createSearchTool(dir) {
       },
       render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
     },
-    async execute(args) {
-      return { text: searchJournal(dir, args?.query, args?.days) }
+    // 目录传函数时 execute 现取（同 tools.mjs 的 resolveDir 契约），兼容纯字符串。
+    async execute(args, exec) {
+      const resolved = typeof dir === 'function' ? dir(exec?.agent) : dir
+      return { text: searchJournal(typeof resolved === 'string' ? resolved : '', args?.query, args?.days) }
     },
   }
 }

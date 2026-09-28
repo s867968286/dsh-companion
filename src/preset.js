@@ -341,22 +341,25 @@ export function apply(ctx, rawConfig) {
    * 记忆工具：读（检索历史日志）+ 写（日志 / 长期记忆）。
    *
    * 工具是**按 agent 注册**的，但伙伴的目录要等会话绑定时才知道，
-   * 所以工厂接收一个「取目录」函数而不是固定路径 —— 每次调用时现取，
-   * 这样"先建会话、后选伙伴"也能命中正确的目录。
+   * 所以工厂接收一个「取目录」函数 —— 工具在**每次 execute 时**现取
+   * （官方把 `exec.agent` 传进 execute），这样"先建会话、后选伙伴"
+   * 也能命中正确的目录。注意这里传的是**函数本身**而不是 `dirFor()`：
+   * 传返回值会在注册那一刻固化，窗口期后选伙伴的会话仍指向回落目录。
    */
   if (typeof ctx.tools?.register === 'function') {
-    const dirFor = () => {
-      const dir = resolveCompanionDir(null)
+    const dirFor = (agent) => {
+      const dir = resolveCompanionDir(agent)
       return dir || legacyDir
     }
     const toolFactories = [
-      [createSearchTool, 'preset_md_search'],
-      [createJournalTool, 'preset_md_journal'],
-      [createMemoryTool, 'preset_md_memory'],
+      [createSearchTool, 'companion_search'],
+      [createJournalTool, 'companion_journal'],
+      [createMemoryTool, 'companion_memory'],
     ]
     for (const [factory, toolName] of toolFactories) {
       try {
-        ctx.tools.register(factory(dirFor()))
+        // 传函数本身（execute 时现取），不是 dirFor() 的返回值
+        ctx.tools.register(factory(dirFor))
       } catch (error) {
         // 成功不打日志：三个工具每次都一样，写进去只是噪音；失败才值得说。
         logger.warn?.(

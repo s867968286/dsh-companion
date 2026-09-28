@@ -8,7 +8,7 @@ import { mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { DEFAULT_CONTEXT_BUDGET } from './core.js'
-import { atomicWrite, readText } from './memory-store.mjs'
+import { atomicWrite, enqueue, readText } from './memory-store.mjs'
 
 /** 默认设置。 */
 export const DEFAULT_SETTINGS = {
@@ -150,25 +150,82 @@ export function readBindings(paths) {
 }
 
 /**
- * 写一个会话的绑定。`companion` 为 null / 空 → 显式「无伙伴」。
- * @returns 写入后的整张表。
+ * 整表写回。
+ *
+ * ⚠️ 只给**已经在 `enqueue(bindingsFile, …)` 队列内部**的调用方使用
+ * （目前是 binding-gc 的清理）——它不做读-改-写，直接落盘，
+ * 在队列外调用会覆盖并发写入。
  */
-export function writeBinding(paths, sessionId, companion) {
-  if (typeof sessionId !== 'string' || sessionId === '') return readBindings(paths)
-  const next = readBindings(paths)
-  next[sessionId] = companion ? String(companion) : null
+export function writeBindings(paths, table) {
+  const next = {}
+  for (const [key, value] of Object.entries(table ?? {})) {
+    if (typeof key !== 'string' || key === '') continue
+    if (value === null) next[key] = null
+    else if (typeof value === 'string' && value !== '') next[key] = value
+  }
   mkdirSync(dirname(paths.bindingsFile), { recursive: true })
   atomicWrite(paths.bindingsFile, `${JSON.stringify(next, null, 2)}\n`)
   return next
 }
 
-/** 删一个会话的绑定（会话销毁时清理，避免无限增长）。 */
+/**
+ * 写一个会话的绑定。`companion` 为 null / 空 → 显式「无伙伴」。
+ *
+ * 进 `enqueue` 队列：调用方可能是 HTTP 请求（选伙伴）或后台任务，
+ * 而 GC 清理也在同一队列里做读-改-写，两者必须串行，否则互相覆盖。
+ * @returns {Promise<object>} 写入后的整张表。
+ */
+export function writeBinding(paths, sessionId, companion) {
+  if (typeof sessionId !== 'string' || sessionId === '') return Promise.resolve(readBindings(paths))
+  return enqueue(paths.bindingsFile, () => {
+    const next = readBindings(paths)
+    next[sessionId] = companion ? String(companion) : null
+    return writeBindings(paths, next)
+  })
+}
+
+/**
+ * 删一个会话的绑定。
+ *
+ * 只在两个地方调用：会话被切到别的预设、用户显式选了「无伙伴」。
+ * **不在 `agent/disposed` 调用** —— 那个事件只表示"活着的 agent 对象没了"
+ * （进程重启/归档/关窗口都会触发），绑定要活下来供重开会话时恢复。
+ *
+ * 与其它写操作共用同一个按路径队列：GC 也在队列里做读-改-写，
+ * 三者串行才不会互相覆盖。
+ * @returns {Promise<object>} 写入后的整张表。
+ */
 export function deleteBinding(paths, sessionId) {
-  if (typeof sessionId !== 'string' || sessionId === '') return readBindings(paths)
-  const next = readBindings(paths)
-  if (!(sessionId in next)) return next
-  delete next[sessionId]
-  mkdirSync(dirname(paths.bindingsFile), { recursive: true })
-  atomicWrite(paths.bindingsFile, `${JSON.stringify(next, null, 2)}\n`)
-  return next
+  if (typeof sessionId !== 'string' || sessionId === '') return Promise.resolve(readBindings(paths))
+  return enqueue(paths.bindingsFile, () => {
+    const next = readBindings(paths)
+    if (!(sessionId in next)) return next
+    delete next[sessionId]
+    return writeBindings(paths, next)
+  })
+}
+
+/**
+ * 清掉所有指向某个伙伴的绑定（删除伙伴时调用）。
+ *
+ * 不清理的后果：绑定表里留着指向已删伙伴的记录，重开会话时按它解析出
+ * 一个不存在的目录 → 静默不注入（表现为"人设莫名没了"），且记录永不消失。
+ *
+ * @returns {Promise<{removed: number}>} 被清掉的会话数。
+ */
+export function deleteBindingsFor(paths, companionId) {
+  const id = typeof companionId === 'string' ? companionId : ''
+  if (id === '') return Promise.resolve({ removed: 0 })
+  return enqueue(paths.bindingsFile, () => {
+    const current = readBindings(paths)
+    const next = {}
+    let removed = 0
+    for (const [sessionId, bound] of Object.entries(current)) {
+      if (bound === id) { removed += 1; continue }
+      next[sessionId] = bound
+    }
+    if (removed === 0) return { removed: 0 }
+    writeBindings(paths, next)
+    return { removed }
+  })
 }

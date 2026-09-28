@@ -1,5 +1,5 @@
 /**
- * 写入类工具单测：preset_md_journal（写日志）与 preset_md_memory（更新记忆）。
+ * 写入类工具单测：companion_journal（写日志）与 companion_memory（更新记忆）。
  *
  * 重点验证「必须走工具」的三条理由是否真的成立：
  * 串行入队、changelog 留痕、old_text 校验。
@@ -16,13 +16,13 @@ import { JOURNAL_TOOL_NAME, MEMORY_TOOL_NAME, createJournalTool, createMemoryToo
 const makeDir = () => mkdtempSync(join(tmpdir(), 'companion-tools-'))
 const read = (file) => readFileSync(file, 'utf8')
 
-/* ─────────────────────────── preset_md_journal ─────────────────────────── */
+/* ─────────────────────────── companion_journal ─────────────────────────── */
 
 test('createJournalTool：工具名与 JSON Schema 形态合法', () => {
   const dir = makeDir()
   const tool = createJournalTool(dir)
   assert.equal(tool.name, JOURNAL_TOOL_NAME)
-  assert.equal(tool.name.startsWith('preset_md_'), true)
+  assert.equal(tool.name.startsWith('companion_'), true)
   // parameters 必须是标准 JSON Schema（扁平 DSL 会让 provider 400）
   assert.equal(tool.parameters.type, 'object')
   assert.deepEqual(Object.keys(tool.parameters.properties), ['body'])
@@ -55,7 +55,7 @@ test('createJournalTool：body 为空 / 非字符串被拒绝，不落盘', asyn
   rmSync(dir, { recursive: true, force: true })
 })
 
-/* ─────────────────────────── preset_md_memory ─────────────────────────── */
+/* ─────────────────────────── companion_memory ─────────────────────────── */
 
 test('createMemoryTool：工具名、file 枚举限定为可写白名单', () => {
   const dir = makeDir()

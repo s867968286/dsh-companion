@@ -43,8 +43,11 @@ import {
   COMPANION_PERSONA_SECTION,
   COMPANION_PERSONA_VARIABLE,
   contextBudgetNotice,
+  contextFacts,
+  createSessionFreeze,
   measureContext,
   readAggregateText,
+  sessionKeyOf,
   substitutePlaceholders,
 } from './core.js'
 
@@ -118,11 +121,12 @@ export function companionFromEvents(events) {
  * @param {object} paths - `resolvePaths()` 的结果。
  * @param {string} sessionId - 会话 id。
  * @param {string|null} companion - 伙伴 id；null 表示「无伙伴」。
- * @returns {string|null} 归一化后的绑定值。
+ * @returns {Promise<string|null>} 归一化后的绑定值（落盘完成后 resolve）。
  */
-export function recordCompanionSelection(paths, sessionId, companion) {
+export async function recordCompanionSelection(paths, sessionId, companion) {
   const value = normalizeCompanion(companion)
-  writeBinding(paths, sessionId, value)
+  // 写绑定进按路径队列：与孤儿清理（GC）共用同一队列，避免并发覆盖。
+  await writeBinding(paths, sessionId, value)
   return value
 }
 
@@ -158,6 +162,25 @@ export function injectCompanionPrompt(ctx, dir, getSettings) {
   let disposeVariable = null
   let active = ''
 
+  /*
+   * 会话冻结缓存（E1）：官方 assemble() 每个 pre-step 都会调 variable provider
+   * （dsh-agent-loop/lib/index.js:907 → dsh-system-prompt/lib/index.js:315-316），
+   * 没缓存 = 每步重读 6 个 MD × 2 遍 + 同步读设置；且会话中途改 MD 会让系统
+   * 提示词（请求前缀）变化，KV 缓存前缀全部失效。
+   *
+   * 这里与 core.registerPrompt 用同一套 createSessionFreeze：首次渲染后冻结，
+   * 改 Markdown 要新开对话才生效（README「固定行为」承诺的就是这个）。
+   * 缓存键 = 会话 id + 目录：refresh 换目录时键变化，旧缓存自然失效，无需手动清理。
+   * dispose 时整体清空（会话销毁后不再复用）。
+   */
+  const cache = createSessionFreeze()
+  const cacheKeyOf = (context, forDir) => {
+    const session = sessionKeyOf(context)
+    if (session) return `${session}\u0000${forDir}`
+    const facts = contextFacts(context, forDir)
+    return `__no_session__:${facts.cwd || '-'}:${facts.presetDir || '-'}`
+  }
+
   const clear = () => {
     // 先撤 section 再撤变量：顺序反了会在极短窗口里留下"引用了不存在的变量"的段。
     try { disposeSection?.() } catch { /* 已撤 */ }
@@ -165,6 +188,7 @@ export function injectCompanionPrompt(ctx, dir, getSettings) {
     disposeSection = null
     disposeVariable = null
     active = ''
+    cache.clearAll()
   }
 
   const install = (nextDir) => {
@@ -179,7 +203,18 @@ export function injectCompanionPrompt(ctx, dir, getSettings) {
     })
     disposeVariable = ctx.systemPrompt.variable(
       COMPANION_PERSONA_VARIABLE,
-      () => readCompanionPrompt(nextDir, getSettings()),
+      (context) => {
+        const s = getSettings?.() || {}
+        const budgetChars = Number.isFinite(s.contextBudget) && s.contextBudget > 0 ? s.contextBudget : DEFAULT_CONTEXT_BUDGET
+        const budgetNotice = s.budgetNotice !== false
+        return cache.get(cacheKeyOf(context, nextDir), () => {
+          // 与 core.registerPrompt.render 相同的缓存边界：读 MD + 占位符替换 + 超限提醒整段冻结。
+          const body = substitutePlaceholders(readAggregateText(nextDir), contextFacts(context, nextDir))
+          if (!budgetNotice) return body
+          const notice = contextBudgetNotice(measureContext(nextDir, { budgetChars }), { warnAt: 1 })
+          return notice ? `${body}\n\n${notice}` : body
+        })
+      },
     )
     active = nextDir
   }
@@ -195,21 +230,4 @@ export function injectCompanionPrompt(ctx, dir, getSettings) {
     dispose: clear,
     current: () => active,
   }
-}
-
-/**
- * 读一个伙伴目录，拼成提示词正文（含超限提醒）。
- *
- * 与 `core.registerPrompt` 的渲染保持一致：占位符替换 + 预算提醒。
- * 这里独立实现是因为 host 半直接持有目录，不需要 core 那套"按会话解析目录"
- * 的间接层；共享的是同一套 `readAggregateText` / `substitutePlaceholders`。
- */
-export function readCompanionPrompt(dir, settings = {}) {
-  const body = substitutePlaceholders(readAggregateText(dir), { presetDir: dir })
-  if (settings.budgetNotice === false) return body
-  const budget = Number.isFinite(settings.contextBudget) && settings.contextBudget > 0
-    ? settings.contextBudget
-    : DEFAULT_CONTEXT_BUDGET
-  const notice = contextBudgetNotice(measureContext(dir, { budgetChars: budget }), { warnAt: 1 })
-  return notice ? `${body}\n\n${notice}` : body
 }

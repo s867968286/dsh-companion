@@ -17,6 +17,7 @@ import {
   injectCompanionPrompt,
   normalizeCompanion,
   recordCompanionSelection,
+  restrictCompanionTools,
 } from './companion.mjs'
 import {
   DEFAULT_SETTINGS,
@@ -79,235 +80,229 @@ function assertLength(value, max, label) {
  * ------------------------------------------------------------------ */
 
 /**
- * 该值能否不加引号直接写（保守：只放行安全字符）。
+ * 伙伴元数据文件名。
  *
- * **必须额外拒绝 YAML 会隐式类型化的形态**——这是本插件最容易踩的坑。
+ * ## 为什么是 JSON 而不是原来的 preset.yml
  *
- * 实况（rc2）：`preset.yml` 已**没有官方读取方**——官方预设改由 bundle 声明，
- * 旧的目录元数据读取（`dsh-agent-presets` 的 `readPresetMetadata`）已不存在，
- * 全树搜不到读它的代码。但**格式仍按 YAML 约定维护**，因为：
- * 1. 用户会手工编辑它，手写时不会在意引号；
- * 2. 将来若要回到"官方可识别"的形态，文件得是合法 YAML 且类型正确。
+ * 原先每个伙伴目录里放的是 `preset.yml`——那是从「伙伴即官方预设目录」时代
+ * 继承下来的格式（当时归官方 `@deepseek-ai/dsh-agent-presets` 管理，该包在
+ * rc2 已不存在，官方全树搜不到读它的代码）。
  *
- * 未加引号时 `123` / `true` / `null` / `~` / `2026-09-13` 会被 YAML 解析成
- * number / boolean / null / Date 而非字符串。**实际受害的是 `order`**：
- * `readPresetMeta` 对它做 `Number(orderText)`，`2026-09-13` 这类值会被解析失败
- * 而**整条 order 丢失**（回落 undefined），该伙伴于是掉到列表末尾。
- * 实测：`order: 2026-09-13` → 读回结果里没有 order。
+ * 它带来**三份本可以没有的复杂度**：
+ * 1. 手写正则逐行 `pick(key)`，只认三个标量字段；
+ * 2. 按行合并写入（`mergePresetMeta`），只为保护注释与不认识的键；
+ * 3. YAML 隐式类型化——`order: 2026-09-13` 会被读成 Date 而不是字符串，
+ *    于是 `Number(orderText)` 失败、整条 order 丢失、伙伴掉到列表末尾。
+ *    为此还要维护 `isPlainSafe` / `looksTyped` / `quote` / `unquote` 四个函数。
  *
- * 所以这些形态一律强制加引号，让它作为字符串被读回。
+ * 换成 JSON 后这四样**全部消失**：`JSON.parse` 自带转义与类型，
+ * 没有注释要保护，也没有隐式类型化。文件名与全局设置同名（`settings.json`），
+ * 且同样住在 `companion/` 下，心智一致。
+ *
+ * 兼容：老伙伴目录里的 `preset.yml` 由 `migrateCompanionMeta` 一次性迁移，
+ * 迁移后旧文件**保留不删**（用户手工写过的内容留作回滚依据）。
  */
-export function isPlainSafe(text) {
-  if (text === '') return false
-  if (/^[\s]|[\s]$/.test(text)) return false
-  if (/[:#'"\n\r\t\\]/.test(text)) return false
-  if (/^[-?*&!|>%@`{}[\]]/.test(text)) return false
-  if (looksTyped(text)) return false
-  return true
+export const META_FILE = 'settings.json'
+
+/** 旧格式元数据文件名，只在迁移与兜底读时使用。 */
+export const LEGACY_META_FILE = 'preset.yml'
+
+/**
+ * 伙伴自己的设置（住在伙伴目录里）。
+ *
+ * 与全局 `settings.json`（`~/.dsh/companion/settings.json`）区分：
+ * 全局那份是**插件级**开关（设置页管），这一份是**单个伙伴**的覆盖。
+ *
+ * @typedef {object} CompanionMeta
+ * @property {string} name - 昵称（必填，调用方保证非空）。
+ * @property {string} description - 签名，可为空串。
+ * @property {number|undefined} order - 排序号；缺失排最后（不回落 0）。
+ * @property {object|undefined} tools - 工具收窄，见 normalizeToolFilter。
+ * @property {boolean|undefined} autoMemory - 覆盖全局自动记忆开关；undefined = 跟随全局。
+ */
+
+/**
+ * 从任意对象里挑出本插件认识的字段并归一化。
+ *
+ * 不认识的键**原样丢弃**——JSON 没有注释要保护，也没有「官方将来会读」的顾虑，
+ * 与旧 preset.yml 的「按行合并、其余保留」是相反的取舍，这里刻意从简。
+ *
+ * @param {unknown} raw - JSON.parse 的结果，或调用方传入的部分字段。
+ * @returns {CompanionMeta}
+ */
+export function normalizeMeta(raw) {
+  const input = raw && typeof raw === 'object' ? raw : {}
+  const name = input.name
+  const description = input.description
+  const orderValue = input.order
+  const order = typeof orderValue === 'number' && Number.isFinite(orderValue)
+    ? orderValue
+    : (typeof orderValue === 'string' && orderValue.trim() !== '' && Number.isFinite(Number(orderValue))
+      ? Number(orderValue)
+      : undefined)
+  return {
+    name: typeof name === 'string' ? name : '',
+    description: typeof description === 'string' ? description : '',
+    order,
+    /*
+     * tools 保持原始形态交给 normalizeToolFilter 处理（它在 core.js，
+     * 是工具收窄的唯一入口）；这里只在**完全没写**时给 undefined，
+     * 以便区分「没配 = 不限制」与「配了空对象」。
+     */
+    tools: input.tools === undefined || input.tools === null ? undefined : input.tools,
+    /*
+     * autoMemory 只认布尔。写别的类型（"true" / 1）一律当**没写**，
+     * 跟随全局——比猜一个真值安全：猜错会让伙伴静默不记忆或静默狂写。
+     */
+    autoMemory: typeof input.autoMemory === 'boolean' ? input.autoMemory : undefined,
+    /*
+     * suppressRuntimeContext：屏蔽官方的 runtime-context 注入块
+     * （当前文件策略 / 审批策略 / 工作区信息等一大段）。
+     *
+     * 对**纯聊天**伙伴有用：那段文字讲的是"你在哪个工作区、能改哪些文件"，
+     * 对一个只负责聊天的伙伴既是噪音也占 token。
+     * 官方 API 是 `ctx.systemPrompt.suppressRuntimeContext()`
+     * （dsh-system-prompt/lib/index.js:276，挂在 agent scope 上）。
+     *
+     * 与 autoMemory 同一约定：只认布尔，写别的类型当没写（= 不屏蔽）。
+     */
+    suppressRuntimeContext:
+      typeof input.suppressRuntimeContext === 'boolean' ? input.suppressRuntimeContext : undefined,
+  }
 }
 
 /**
- * 该标量是否会被 YAML 隐式解析成非字符串（number / boolean / null / Date）。
+ * 读伙伴自己的设置。
  *
- * 覆盖 js-yaml 的核心 schema：十进制（含 `+1`、`.5`、`1.5`、`1e3`）、
- * 八进制 `0o17`、十六进制 `0x10`、`.inf`/`.nan`、布尔与 null 的全套写法
- * （`true|false|yes|no|on|off` 及大小写变体、`null|~|`）、
- * 以及会被读成 Date 的日期/时间戳形态。
+ * 容错策略：文件缺失 / JSON 损坏 / 顶层不是对象，一律当成**空配置**返回
+ * （name 空串、其余 undefined），由调用方兜底。绝不抛——一个伙伴的元数据
+ * 坏掉不该让整个伙伴列表读不出来。
  *
- * 宁可多引几个（多一对引号无害），也不要漏——漏一个就是静默丢昵称。
- */
-export function looksTyped(text) {
-  const value = String(text ?? '')
-  if (value === '') return false
-  // 布尔与 null 的全套拼写（YAML 1.1 的 yes/no/on/off，js-yaml 默认仍认）
-  if (/^(?:true|false|yes|no|on|off|null|~)$/i.test(value)) return true
-  // 数值：十进制（含符号、小数点、指数）、八进制、十六进制、无穷与 NaN
-  if (/^[-+]?(?:0b[01_]+|0o?[0-7_]+|0x[0-9a-f_]+|\d[\d_]*(?:\.\d*)?(?:[eE][-+]?\d+)?|\.\d+(?:[eE][-+]?\d+)?)$/i.test(value)) return true
-  if (/^[-+]?\.(?:inf|nan)$/i.test(value)) return true
-  // 日期 / 时间戳：`2026-09-13`、`2026-09-13 10:00:00`、`2026-09-13T10:00:00Z`
-  if (/^\d{4}-\d{1,2}-\d{1,2}(?:[Tt ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d*)?)?(?:[ \t]*(?:Z|[-+]\d{1,2}(?::\d{2})?))?)?$/.test(value)) return true
-  return false
-}
-
-/** 序列化成 preset.yml 里的一行标量。 */
-function quote(value) {
-  const text = String(value ?? '')
-  if (isPlainSafe(text)) return text
-  const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '\\n')
-  return `"${escaped}"`
-}
-
-/** 解析一行标量（与 quote 对称）。 */
-function unquote(value) {
-  const text = String(value ?? '').trim()
-  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) {
-    return text
-      .slice(1, -1)
-      .replace(/\\(u[0-9a-fA-F]{4}|.)/g, (match, token) => {
-        if (token === 'n') return '\n'
-        if (token === 't') return '\t'
-        if (token === 'r') return '\r'
-        if (token === '\\') return '\\'
-        if (token === '"') return '"'
-        if (token.startsWith('u')) return String.fromCharCode(Number.parseInt(token.slice(1), 16))
-        return match
-      })
-  }
-  if (text.length >= 2 && text.startsWith("'") && text.endsWith("'")) {
-    return text.slice(1, -1).replace(/''/g, "'")
-  }
-  return text
-}
-
-/**
- * 读 preset.yml 的三个字段。
+ * **回落旧格式**：`settings.json` 不存在但 `preset.yml` 在时，读旧文件。
+ * 这样即使迁移还没跑（或迁移失败），伙伴也不会突然"没有名字"。
  *
- * - 字段缺失 → `undefined`（不回落 0 / ''），由调用方决定兜底；
- * - 支持 `key: "带: 冒号和引号"` 的引号值；
- * - 不支持 YAML 块标量（`key: |`）——读到会当成字面值 `|`，但不会污染别的字段。
- *
- * 刻意**只读三个字段**：其余键（`id` / `model` / 用户自加的）与本插件无关，
- * 由 `mergePresetMeta` 原样保留即可，这里读不读都不影响它们。
+ * @param {string} dir - 伙伴目录。
+ * @returns {CompanionMeta}
  */
 export function readPresetMeta(dir) {
-  const text = readText(join(dir, 'preset.yml'))
+  const file = join(dir, META_FILE)
+  if (!existsSync(file)) {
+    const legacy = readLegacyMeta(dir)
+    if (legacy !== undefined) return legacy
+    return normalizeMeta({})
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(readText(file) || '{}')
+  } catch {
+    return normalizeMeta({})
+  }
+  return normalizeMeta(parsed)
+}
+
+/**
+ * 从旧格式 `preset.yml` 里读三个标量字段（够用的极简解析）。
+ *
+ * 刻意**不解析 `tools`**：旧文件里若有它，保留在 yml 里由用户自己搬过去，
+ * 我们不猜 YAML 的嵌套结构——猜错会让工具静默消失或全被挡掉。
+ *
+ * @param {string} dir - 伙伴目录。
+ * @returns {CompanionMeta|undefined} 旧文件不存在时返回 undefined。
+ */
+function readLegacyMeta(dir) {
+  const legacy = join(dir, LEGACY_META_FILE)
+  if (!existsSync(legacy)) return undefined
+  const text = readText(legacy)
   const pick = (key) => {
     const match = new RegExp(`^${key}:[ \\t]*(.*)$`, 'm').exec(text)
-    return match ? unquote(match[1]) : undefined
+    if (!match) return undefined
+    const value = match[1].trim()
+    // 去引号（旧格式的 quote/unquote 只服务这三个标量，这里够用）
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      try { return JSON.parse(value) } catch { return value.slice(1, -1) }
+    }
+    if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1)
+    return value
   }
   const orderText = pick('order')
-  const order = orderText === undefined ? undefined : Number(orderText)
-  const name = pick('name')
-  const description = pick('description')
-  return {
-    name: name === undefined ? '' : name,
-    description: description === undefined ? '' : description,
+  const order = orderText === undefined || orderText === '' ? undefined : Number(orderText)
+  return normalizeMeta({
+    name: pick('name'),
+    description: pick('description'),
     order: Number.isFinite(order) ? order : undefined,
-  }
+  })
 }
 
 /**
- * 写 preset.yml（原子写）。
+ * 写伙伴自己的设置（原子写）。
  *
- * ## 为什么是「按行合并」而不是整文件重写
+ * **整份重写**，与该文件「只有本插件读」的定位一致。字段写入规则：
+ * - `name` 始终写（调用方保证非空）；
+ * - `description` / `order` 为 `undefined` 时不写该键（保持「没设过就不落键」，
+ *   与旧实现一致：缺 order 要排最后，写成 0 会让它跳到最前）；
+ * - `tools` / `autoMemory` 为 `undefined` 时不写，**已有值原样保留**——
+ *   设置页只改昵称/签名，不该顺手把用户手工配的工具收窄抹掉。
  *
- * preset.yml **不是本插件独有的文件**：它是从"伙伴即官方预设目录"那个时代
- * 继承下来的格式（当时归官方 `@deepseek-ai/dsh-agent-presets` 管理，
- * 该包在 rc2 已不存在）。现在**只有本插件读它**，但用户仍会手工编辑：
- * 加注释、加本项目不读的键（`id` / `model` / `tools.deny` …），甚至整份手写。
- *
- * 早先这里是「三个字段写全、其余丢弃」的整文件重写，实测改一次昵称就会把
- * 注释与 `id` / `model` / `tools.deny` 全部抹掉——而 `readPresetMeta` 只读三个字段，
- * 看不出这个损失。所以现在改成：**只替换三个已知键的行，其余原样保留**。
- *
- * ## 三条写法规则
- *
- * - **order 为 undefined 时不写该行**（而不是写 0）。缺失要排在最后：
- *   官方对**预设声明**的排序是 `order ?? Infinity`
- *   （`dsh-agent-preset-registry/lib/index.js:587`），本插件 `listAgents` 也用
- *   `order ?? Number.MAX_SAFE_INTEGER` 对齐同一语义。写成 0 会让它从列表末尾
- *   跳到最前——正好相反。
- * - **description 为空时同样不新增该行**（「省略」而非「写空」），保持与
- *   `order` 一致的"没设过就不落行"约定；但**原文里已有该行就照常更新**
- *   （含更新成 `""`）——用户显式清空签名与「从来没设过」是两件事。
- * - **name 始终写**：昵称是必须项。调用方已保证非空（`/meta` 显式拒绝清空），
- *   这里空值也会落一行显式空串，免得「没昵称」和「没这文件」分不清。
+ * @param {string} dir - 伙伴目录。
+ * @param {Partial<CompanionMeta>} patch - 要更新的字段。
  */
-export function writePresetMeta(dir, { name, description, order }) {
-  const file = join(dir, 'preset.yml')
-  const next = mergePresetMeta(readText(file), { name, description, order })
-  atomicWrite(file, next)
-}
+export function writePresetMeta(dir, patch = {}) {
+  const prev = readPresetMeta(dir)
+  const next = { name: patch.name !== undefined ? patch.name : prev.name }
+  const description = patch.description !== undefined ? patch.description : prev.description
+  const order = patch.order !== undefined ? patch.order : prev.order
+  const tools = patch.tools !== undefined ? patch.tools : prev.tools
+  const autoMemory = patch.autoMemory !== undefined ? patch.autoMemory : prev.autoMemory
+  const suppressRuntimeContext = patch.suppressRuntimeContext !== undefined
+    ? patch.suppressRuntimeContext
+    : prev.suppressRuntimeContext
 
-/**
- * 把三个字段合并进原文，返回新的文件文本。
- *
- * 逐行扫描：命中 `name:` / `description:` / `order:` 的**顶层**行就替换掉整行，
- * 其余行（注释、空行、别的键、以及它们的子行）逐字保留。原文里没有的键，
- * 按下面的「按需追加」规则决定是否补到末尾。保留原文的换行风格（CRLF / LF）。
- *
- * 单独导出是为了可单测——它是这个文件里唯一有真实复杂度的逻辑。
- */
-export function mergePresetMeta(prev, { name, description, order }) {
-  const source = String(prev ?? '')
-  const eol = detectPresetEol(source)
-  const lines = source.replace(/\r\n/g, '\n').split('\n')
-
-  // 要写入的键 -> { line, append }；append 表示「原文没有时是否补一行」
-  const wanted = new Map()
-  if (name !== undefined) wanted.set('name', { line: `name: ${quote(name)}`, append: true })
-  if (description !== undefined) {
-    /*
-     * 空的 description **只更新已有行、不新增**：与 order 同一约定
-     * ——「没设过就不落行」，避免把从未声明过的字段固化进文件。
-     * 有值则允许追加——用户确实设了签名，不该因为原文没这行就丢掉。
-     */
-    const text = quote(description)
-    wanted.set('description', { line: `description: ${text}`, append: String(description) !== '' })
-  }
-  if (Number.isFinite(order)) wanted.set('order', { line: `order: ${order}`, append: true })
-
-  const written = new Set()
-  const out = []
   /*
-   * 是否正在跳过「被替换掉的块标量的内容行」。
-   *
-   * 两个用途都用它，但语义相反，必须分开：
-   * - 命中块标量起始行（`description: |`）→ 该行被替换成单行标量，
-   *   它原来那些缩进内容行必须**一起丢掉**，否则残留下来就是非法 YAML
-   *   （顶层出现缩进行）。所以「替换后」也要继续吞掉后续缩进行。
-   * - 没命中块标量起始行（例如我们这次不动 description）→ 内容行里可能出现
-   *   长得像 `name: xxx` 的文本，不能被误当成字段替换，同样要跳过。
+   * description 为空串时**仍然写**（用户显式清空签名与「从来没设过」是两件事，
+   * 与旧实现的约定一致）；只有 undefined 才不落键。
    */
-  let inBlockScalar = false
-  /** 当前跳过的块，是不是「正被替换」的那个（决定内容行丢弃还是保留）。 */
-  let swallowBlockBody = false
-  for (const line of lines) {
-    if (inBlockScalar) {
-      if (line.trim() === '' || /^\s/.test(line)) {
-        // 内容行：若这个块正被替换，就整行丢弃；否则原样保留
-        if (!swallowBlockBody) out.push(line)
-        continue
-      }
-      inBlockScalar = false
-      swallowBlockBody = false
-    }
+  if (patch.description !== undefined || prev.description !== '') next.description = description
+  if (order !== undefined) next.order = order
+  if (tools !== undefined) next.tools = tools
+  if (autoMemory !== undefined) next.autoMemory = autoMemory
+  if (suppressRuntimeContext !== undefined) next.suppressRuntimeContext = suppressRuntimeContext
 
-    const match = /^(name|description|order):[ \t]*(.*)$/.exec(line)
-    if (match && wanted.has(match[1]) && !written.has(match[1])) {
-      const entry = wanted.get(match[1])
-      out.push(entry.line)
-      written.add(match[1])
-      if (/^[|>]/.test(match[2].trim())) {
-        // 块标量起始行被替换：把它原来的内容行也一并吞掉
-        inBlockScalar = true
-        swallowBlockBody = true
-      }
-      continue
-    }
-    out.push(line)
+  atomicWrite(join(dir, META_FILE), `${JSON.stringify(next, null, 2)}
+`)
+}
+
+/**
+ * 把老伙伴目录里的 `preset.yml` 迁成 `settings.json`。
+ *
+ * 只在 **settings.json 不存在、preset.yml 存在**时动手；迁完**保留旧文件**
+ * （用户手工写过的东西留作回滚依据，也符合本插件「删除=归档不真删」的约定）。
+ *
+ * 旧文件是 YAML，这里用**够用的极简解析**而不是引依赖：只认顶层
+ * `key: value` 三个标量键（与旧 readPresetMeta 同能力），遇到看不懂的形态
+ * 就跳过——迁移是尽力而为，失败也只是让那个伙伴回落「无元数据」，
+ * 不该阻止插件启动。刻意**不解析 tools**：旧文件里若有它，保留在 yml 里
+ * 由用户自己搬，我们不猜 YAML 的嵌套结构。
+ *
+ * @param {string} dir - 伙伴目录。
+ * @returns {{migrated: boolean, read?: object}} 是否迁移、以及读到的原始字段。
+ */
+export function migrateCompanionMeta(dir) {
+  const target = join(dir, META_FILE)
+  const legacy = join(dir, LEGACY_META_FILE)
+  if (existsSync(target) || !existsSync(legacy)) return { migrated: false }
+
+  const meta = readLegacyMeta(dir)
+  if (meta === undefined) return { migrated: false }
+  try {
+    writePresetMeta(dir, {
+      name: meta.name,
+      description: meta.description,
+      order: meta.order,
+    })
+    return { migrated: true, read: meta }
+  } catch {
+    return { migrated: false }
   }
-
-  // 原文里没有的键，按 append 规则补到末尾（先去掉尾部空行，避免越攒越多）
-  const appended = [...wanted.entries()]
-    .filter(([key, entry]) => !written.has(key) && entry.append)
-    .map(([, entry]) => entry.line)
-  let body = out.join('\n').replace(/\n+$/, '')
-  if (appended.length > 0) body = body ? `${body}\n${appended.join('\n')}` : appended.join('\n')
-  return applyPresetEol(`${body}\n`, eol)
-}
-
-/** 探测文本的主换行风格（与 memory-store 的 detectEol 同规则，避免循环依赖而本地实现）。 */
-function detectPresetEol(text) {
-  const source = String(text ?? '')
-  const crlf = (source.match(/\r\n/g) || []).length
-  const lf = (source.match(/\n/g) || []).length - crlf
-  return crlf > lf ? '\r\n' : '\n'
-}
-
-/** 把 LF 文本还原成指定换行风格。 */
-function applyPresetEol(text, eol) {
-  return eol === '\r\n' ? String(text).replace(/\n/g, '\r\n') : String(text)
 }
 
 /** 从名字生成合法 id（中文名回落使用 companion 前缀，一眼可辨是本插件创建的）。 */
@@ -345,6 +340,16 @@ export function listAgents(paths) {
   for (const entry of readdirSync(paths.companionsRoot, { withFileTypes: true })) {
     if (!entry.isDirectory() || !PRESET_ID.test(entry.name)) continue
     const dir = join(paths.companionsRoot, entry.name)
+    /*
+     * 顺手迁移旧格式元数据（preset.yml → settings.json）。
+     *
+     * 挂在列表函数里而不是 apply() 里，有两个理由：
+     * ① 列表是**唯一必然读到每个伙伴**的入口，覆盖率天然完整；
+     * ② 它已经对每个目录做了一次 readdir，迁移判断只多一次 existsSync。
+     * 迁移自身幂等（已有 settings.json 就立刻返回），失败静默——坏一个伙伴的
+     * 元数据不该让整个列表读不出来。
+     */
+    migrateCompanionMeta(dir)
     const meta = readPresetMeta(dir)
     rows.push({
       id: entry.name,
@@ -476,9 +481,9 @@ export function copyAgent(paths, sourceId, { name } = {}) {
 
   const renameIn = (text) => (oldName === clean ? text : text.split(oldName).join(clean))
 
-  // 复制六个 MD（preset.yml 由下方按新名字重写）
+  // 复制六个 MD（settings.json 由下方按新名字重写）
   for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
-    if (!entry.isFile() || entry.name === 'preset.yml') continue
+    if (!entry.isFile() || entry.name === META_FILE || entry.name === LEGACY_META_FILE) continue
     if (PRESET_FILES.some((item) => item.file === entry.name)) {
       atomicWrite(join(dir, entry.name), renameIn(readText(join(srcDir, entry.name))))
     }
@@ -531,8 +536,9 @@ export function migrateAgent(paths, id) {
 /**
  * 列出还留在旧位置、可以迁移过来的伙伴 id。
  *
- * 判据是"目录里有 preset.yml 或六个 MD 之一"——只看目录名会把用户在
- * `.agent-presets/` 下随手建的无关目录也算进来。
+ * 判据是"目录里有 settings.json / preset.yml 或六个 MD 之一"——只看目录名
+ * 会把用户在 `.agent-presets/` 下随手建的无关目录也算进来。
+ * 两种元数据文件名都认：迁移前的旧目录只有 preset.yml。
  */
 export function listLegacyAgents(paths) {
   if (!existsSync(paths.legacyPresetsRoot)) return []
@@ -543,7 +549,8 @@ export function listLegacyAgents(paths) {
     .filter((id) => !existsSync(join(paths.companionsRoot, id)))
     .filter((id) => {
       const dir = join(paths.legacyPresetsRoot, id)
-      return existsSync(join(dir, 'preset.yml'))
+      return existsSync(join(dir, META_FILE))
+        || existsSync(join(dir, LEGACY_META_FILE))
         || PRESET_FILES.some((item) => existsSync(join(dir, item.file)))
     })
 }
@@ -828,6 +835,53 @@ export function registerRoutes(ctx, home) {
    */
   const injections = new Map()
   /*
+   * sessionId -> **工具收窄的 disposer**（`tools.restrict()` 的返回值）。
+   *
+   * 为什么必须自己存：官方 restriction 是**只增不减 + 交集**语义
+   * （`dsh-tools/lib/index.js:2641-2644` 的 `admits()` 要求每一条都放行）。
+   * 所以同一个会话**再次** restrict 不会替换旧的，而是与它取交集：
+   *
+   * - 换伙伴（allow=[read] → allow=[read,write]）：交集仍是 [read]，
+   *   新伙伴的 write 永远拿不到；
+   * - 置空「无伙伴」：旧收窄继续生效，置空了还是被限制；
+   * - 切回官方 standard：官方模式本该有全套工具，却仍被我们的 allow 挡着。
+   *
+   * 撤销入口只有 `restrict()` 返回的那个 disposer。丢掉它 = 把会话永久钉在
+   * 第一次下发的收窄上。所以这里按会话存住，换伙伴/置空/切走时**先撤再装**。
+   */
+  const restrictions = new Map()
+  /**
+   * 撤掉某会话已下发的工具收窄。
+   * @param {string} sessionId - 会话 id。
+   */
+  const liftRestriction = (sessionId) => {
+    const dispose = restrictions.get(sessionId)
+    restrictions.delete(sessionId)
+    if (typeof dispose !== 'function') return
+    try {
+      dispose()
+    } catch {
+      /* 已撤或 scope 已销毁 */
+    }
+  }
+  /**
+   * 按伙伴重装收窄：**先撤旧的，再按新伙伴决定装不装**。
+   *
+   * 只有"先撤"才能保证语义是**替换**而不是交集 —— 见 `restrictions` 的说明。
+   * @param {string} sessionId - 会话 id。
+   * @param {string} dir - 伙伴目录；空串表示置空（只撤不装）。
+   */
+  const applyRestrictionFor = (sessionId, dir) => {
+    liftRestriction(sessionId)
+    if (!dir) return
+    const agentCtx = agentCtxOf(sessionId)
+    if (!agentCtx) return
+    const result = restrictCompanionTools(agentCtx, readPresetMeta(dir).tools, ctx.logger)
+    if (result.applied && typeof result.dispose === 'function') {
+      restrictions.set(sessionId, result.dispose)
+    }
+  }
+  /*
    * sessionId -> **该会话 scope 的 ctx**。
    *
    * 必须在这里存下来：`agent/created` 监听器的 `this` 就是 agent scope，
@@ -918,6 +972,25 @@ export function registerRoutes(ctx, home) {
     } catch (error) {
       ctx.logger?.warn?.(`[companion] 会话 ${session.id} 的提示词注入注册失败：${describeError(error)}`)
     }
+
+    /*
+     * 按伙伴收窄工具清单 —— 与上面的提示词注入**同一个落点、同一个 ctx**。
+     *
+     * 为什么必须在这里：`tools.restrict()` 官方要求 agent scope
+     * （`dsh-tools/lib/index.js:2897`，"a context-global restriction would mask
+     * every agent"）。preset 行插件的 ctx 是 preset scope，表达不了"这是哪个伙伴"。
+     *
+     * 数据源是**当前伙伴自己的 settings.json**，所以每个伙伴可以各不相同：
+     * 纯聊天的那个写 `allow`，别的伙伴不写就照常拿到全套工具。
+     *
+     * 失败静默降级（只 warn）：收窄是优化，不该让会话起不来。
+     */
+    try {
+      // 先撤旧的再装（restriction 是交集语义，不撤就会与旧伙伴取交集）
+      applyRestrictionFor(session.id, dir)
+    } catch (error) {
+      ctx.logger?.warn?.(`[companion] 会话 ${session.id} 的工具收窄注册失败：${describeError(error)}`)
+    }
   })
 
   ctx.on?.('agent/disposed', (payload) => {
@@ -925,6 +998,11 @@ export function registerRoutes(ctx, home) {
     if (!session?.id) return
     sessionIndex.delete(session.id)
     agentCtxBySession.delete(session.id)
+    /*
+     * restriction 随 agent scope 销毁会自动失效（它挂在那个 layer 上），
+     * 这里清的是我们自己的 Map 引用 —— 不清会随用过的会话数无限增长。
+     */
+    restrictions.delete(session.id)
     /*
      * ⚠️ 这里**不再**删绑定表里的记录。
      *
@@ -970,17 +1048,52 @@ export function registerRoutes(ctx, home) {
       const bound = readBindings(paths)[sessionId]
       const dir = bound ? join(paths.companionsRoot, normalizeCompanion(bound)) : ''
       const agentCtx = agentCtxOf(sessionId)
-      if (!dir || !existsSync(dir) || !agentCtx || injections.has(sessionId)) return
-      try {
-        injections.set(sessionId, injectCompanionPrompt(agentCtx, dir, () => readSettings(paths)))
-      } catch (error) {
-        ctx.logger?.warn?.(`[companion] 会话 ${sessionId} 切回伙伴模式装回注入失败：${describeError(error)}`)
+      /*
+       * 收窄与注入**各自判各自的前置条件**，不共用同一个 early return。
+       *
+       * 早先这里是 `if (... || injections.has(sessionId)) return`，一个守卫管两件事。
+       * 而 `injections` 记的是**提示词注入**有没有装过：会话在 `agent/created`
+       * 时若已带绑定（恢复旧会话、或"先绑后再切"的常见次序），注入已存在——
+       * 于是整段被跳过，**收窄永远装不上**（2026-09-28 实测事故：09-27 建的历史
+       * 会话当天切到伙伴模式，人设装上了、34 个工具原样可见含 write/edit/pwsh）。
+       *
+       * 所以拆开：注入按 `injections` 幂等，收窄**每次都重装**——`tools.restrict`
+       * 返回的是 disposer，重复调用会叠加 restriction；但同一会话对同一伙伴重复
+       * 装是无害的幂等（filter 完全相同），而漏装的代价是整个功能不生效。
+       * 宁可重复装，不可漏装。
+       */
+      if (dir && existsSync(dir) && agentCtx) {
+        if (!injections.has(sessionId)) {
+          try {
+            injections.set(sessionId, injectCompanionPrompt(agentCtx, dir, () => readSettings(paths)))
+          } catch (error) {
+            ctx.logger?.warn?.(`[companion] 会话 ${sessionId} 切回伙伴模式装回注入失败：${describeError(error)}`)
+          }
+        }
+        /*
+         * 工具收窄：**第二条注册路径**（第一条是 `agent/created`），漏了它会静默失效。
+         * 上面那段"为什么必须听它"的注释早就点明两层是独立的
+         * （"预设决定工具集，伙伴决定 persona section"）—— 收窄就是"工具那一层"。
+         */
+        try {
+          applyRestrictionFor(sessionId, dir)
+        } catch (error) {
+          ctx.logger?.warn?.(`[companion] 会话 ${sessionId} 切回伙伴模式装回工具收窄失败：${describeError(error)}`)
+        }
       }
       return
     }
     // 切走到其他预设：撤人设 + 清绑定，让会话回到"纯官方"状态。
     try { injections.get(sessionId)?.dispose() } catch { /* 已撤 */ }
     injections.delete(sessionId)
+    /*
+     * 工具收窄也要撤 —— 这是本次审查发现的缺陷之一。
+     *
+     * 不撤的后果：切回官方 standard 后，官方模式本该拿到全套工具，
+     * 却仍被上一个伙伴的 allow 名单挡着（restriction 挂在 agent scope 的
+     * layer 上，不会因为换了预设就消失）。
+     */
+    liftRestriction(sessionId)
     deleteBinding(paths, sessionId).catch(() => { /* 清理失败不影响切换 */ })
   })
 
@@ -1096,6 +1209,45 @@ export function registerRoutes(ctx, home) {
         } catch (error) {
           ctx.logger?.warn?.(`[companion] 切换伙伴注入失败：${describeError(error)}`)
         }
+
+        /*
+         * 工具收窄也要在这里装 —— 这是**第三条、也是最关键的一条**注册路径。
+         *
+         * ## 为什么前两条不够（2026-09-28 实测事故）
+         *
+         * 真实交互次序是：**新建会话 → 切预设 → 选伙伴**。而：
+         *
+         * - `agent/created`（会话创建 17:06:11）时绑定表**还是空的** → return；
+         * - `agent-preset/selected`（切预设 17:06:13）时绑定**仍然空** → dir 为空 → 跳过；
+         * - 用户选伙伴写绑定是 **17:06:14**——**在两条事件之后**。
+         *
+         * 绑定写入**本身不触发任何事件**（它只是写 bindings.json），
+         * 所以前两条路径全都抢在绑定之前，收窄永远装不上。
+         * 表现：35 个工具原样可见，含 write / edit / pwsh。
+         *
+         * 这里才是正确的时机：用户明确表达"这个会话用这个伙伴"的那一刻。
+         * 上面那段注入代码早就在这里 refresh 了，收窄当时没跟着做，属于遗漏。
+         *
+         * 选「无伙伴」时不装也不撤：`restrict` 返回的 disposer 我们没有留着，
+         * 撤不掉已下发的 restriction。这与"绑定住 bindings.json、不随会话销毁
+         * 清除"的既有取舍一致（该会话下次重建时自然不带收窄）。
+         */
+        try {
+          /*
+           * wanted 为空 = 置空「无伙伴」：**只撤不装**。
+           * 这里必须真的撤掉，否则置空后旧伙伴的 allow 还生效 —— 用户以为
+           * 放开了，实际仍被限制在旧名单里。
+           */
+          applyRestrictionFor(sessionId, wanted ? join(paths.companionsRoot, wanted) : '')
+          if (wanted) {
+            const agentCtx = agentCtxOf(sessionId)
+            if (!agentCtx) {
+              ctx.logger?.warn?.(`[companion] 会话 ${sessionId} 的 agent scope 不可用，工具收窄将在下次装配时缺省`)
+            }
+          }
+        } catch (error) {
+          ctx.logger?.warn?.(`[companion] 切换伙伴时装工具收窄失败：${describeError(error)}`)
+        }
         return sendJson(res, 200, { current: wanted })
       }
 
@@ -1117,7 +1269,7 @@ export function registerRoutes(ctx, home) {
         const dir = join(paths.companionsRoot, id)
         if (!existsSync(dir)) return sendJson(res, 404, { error: `伙伴不存在：${id}` })
         const current = readPresetMeta(dir)
-        // 昵称不允许清空：静默把 name 行写没会让 preset.yml 丢字段，
+        // 昵称不允许清空：静默把 name 写没会让元数据丢字段，
         // 这里显式拒绝，把决定权交回用户。
         if (body.name !== undefined && String(body.name).trim() === '') {
           return sendJson(res, 400, { error: '昵称不能为空' })

@@ -200,16 +200,21 @@ test('apply：只做工具收窄与自动记忆，不再碰提示词 section（�
   rmSync(dir, { recursive: true, force: true })
 })
 
-test('apply：注册三个记忆工具，tools.deny 下发收窄', () => {
+test('apply：注册三个记忆工具（收窄已不在这里，见 host 半的按伙伴收窄）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'companion-tools-'))
   const ctx = makeCtx(dir)
-  apply(ctx, { tools: { deny: ['mnemon*'] } })
+  apply(ctx, {})
 
   assert.deepEqual(
     ctx.registered.map((tool) => tool.name),
     ['companion_search', 'companion_journal', 'companion_memory'],
   )
-  assert.deepEqual(ctx.restricted, [{ deny: ['mnemon_recall'] }])
+  /*
+   * 工具收窄**不再由 preset 行插件下发**：它必须在 agent scope 里按伙伴做
+   * （官方 `tools.restrict()` 要求 agent.ctx）。对应断言在
+   * test/inject.test.mjs 的「按伙伴收窄」用例里。
+   */
+  assert.deepEqual(ctx.restricted, [], 'preset scope 下不该下发任何收窄')
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -390,6 +395,177 @@ test('自动记忆：上下文压缩前强制归档（否则那段内容压缩�
 
   writeSettings(resolvePaths(), { autoMemory: true, reviewTurns: 3, reviewChars: 2000 })
   rmSync(dir, { recursive: true, force: true })
+})
+
+test('自动记忆：伙伴级 autoMemory=false 覆盖全局开关（纯聊天伙伴用它关掉）', async () => {
+  /*
+   * 全局 autoMemory=true，但绑定的那个伙伴自己写了 autoMemory=false。
+   * 这是「界面管全局、伙伴配置管覆盖」的核心断言。
+   */
+  const dir = mkdtempSync(join(tmpdir(), 'companion-override-off-'))
+  const ctx = makeCtx(dir)
+  const home = mkdtempSync(join(tmpdir(), 'companion-home-'))
+  process.env.DSH_HOME = home
+  try {
+    // 建一个伙伴目录，并把它设为当前会话的绑定
+    const paths = resolvePaths()
+    const companionDir = join(paths.companionsRoot, 'chatty')
+    mkdirSync(companionDir, { recursive: true })
+    writeFileSync(join(companionDir, 'settings.json'), JSON.stringify({ name: '聊天', autoMemory: false }), 'utf8')
+    // 全局打开
+    writeSettings(paths, { autoMemory: true, reviewTurns: 1, reviewChars: 1 })
+    await writeBinding(paths, 's1', 'chatty')
+
+    apply(ctx, {})
+    const turnStopping = ctx.first('agent/turn-stopping')
+    /*
+     * 转写必须有足够内容，否则这条会**空转**：`turn_too_short` 也会让
+     * streams 停在 0，于是"覆盖生效"与"内容太短"分不开——回退实现后
+     * 测试照样绿（第一版就是这样，实测回退验证抓出来的）。
+     * 下面还有一条正对照，证明这个 agent 在开关打开时**确实会**触发。
+     */
+    const longText = 'z'.repeat(2000)
+    const agent = {
+      id: 'a1',
+      session: {
+        id: 's1',
+        requestHeader: () => ({ config: { provider: 'p', model: 'm' } }),
+        snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: longText }], source: { kind: 'user' } } }],
+      },
+    }
+    turnStopping({ agent })
+    await tick()
+    assert.equal(ctx.stats.streams, 0, '伙伴配了 autoMemory=false，即使全局开着也不该回顾')
+
+    /*
+     * 正对照：把该伙伴的覆盖改回「跟随全局」（删掉 autoMemory 键），
+     * 同一个 agent 应该立刻触发。这一条把"覆盖真的在起作用"与
+     * "别的门槛恰好挡住了"区分开。
+     */
+    writeFileSync(join(companionDir, 'settings.json'), JSON.stringify({ name: '聊天' }), 'utf8')
+    const ctx2 = makeCtx(dir)
+    apply(ctx2, {})
+    ctx2.first('agent/turn-stopping')({ agent })
+    await tick()
+    assert.equal(ctx2.stats.streams, 1, '去掉覆盖后应跟随全局 true 并触发（正对照）')
+  } finally {
+    /*
+     * ⚠️ 必须还原成 TEST_HOME，**不能 delete**。
+     *
+     * `delete` 之后 `resolvePaths()` 会回落到真实的 `~/.dsh`，
+     * 而本文件后面还有大量 `writeSettings(resolvePaths(), …)` 的用例 ——
+     * 它们会**直接改写用户的真实配置**。（实测事故：2026-09-28 本机
+     * reviewTurns 被测试从 1 改成了 3。文件顶部那段隔离注释说的就是这个坑，
+     * 而那几处 `delete` 是后来加用例时引入的。）
+     */
+    process.env.DSH_HOME = TEST_HOME
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('自动记忆：伙伴级 autoMemory=true 可覆盖全局关闭', async () => {
+  /*
+   * 反方向同样成立：全局关掉时，某个伙伴可以自己打开。
+   * 语义是「伙伴配了就以它为准」，不是「只能关不能开」。
+   */
+  const dir = mkdtempSync(join(tmpdir(), 'companion-override-on-'))
+  const ctx = makeCtx(dir)
+  const home = mkdtempSync(join(tmpdir(), 'companion-home-'))
+  process.env.DSH_HOME = home
+  try {
+    const paths = resolvePaths()
+    const companionDir = join(paths.companionsRoot, 'talky')
+    mkdirSync(companionDir, { recursive: true })
+    writeFileSync(join(companionDir, 'settings.json'), JSON.stringify({ name: '话痨', autoMemory: true }), 'utf8')
+    writeSettings(paths, { autoMemory: false, reviewTurns: 1, reviewChars: 1 })
+    await writeBinding(paths, 's1', 'talky')
+
+    apply(ctx, {})
+    const turnStopping = ctx.first('agent/turn-stopping')
+    /*
+     * 转写必须有足够内容：太短会被 turn_too_short 跳过（那是另一条路径，
+     * 会把「开关没生效」和「内容太短」混为一谈，测不出覆盖语义）。
+     */
+    const longText = 'z'.repeat(2000)
+    const agent = {
+      id: 'a1',
+      session: {
+        id: 's1',
+        requestHeader: () => ({ config: { provider: 'p', model: 'm' } }),
+        snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: longText }], source: { kind: 'user' } } }],
+      },
+    }
+    turnStopping({ agent })
+    await tick()
+    assert.equal(ctx.stats.streams, 1, '伙伴配了 autoMemory=true，即使全局关着也该回顾')
+  } finally {
+    /*
+     * ⚠️ 必须还原成 TEST_HOME，**不能 delete**。
+     *
+     * `delete` 之后 `resolvePaths()` 会回落到真实的 `~/.dsh`，
+     * 而本文件后面还有大量 `writeSettings(resolvePaths(), …)` 的用例 ——
+     * 它们会**直接改写用户的真实配置**。（实测事故：2026-09-28 本机
+     * reviewTurns 被测试从 1 改成了 3。文件顶部那段隔离注释说的就是这个坑，
+     * 而那几处 `delete` 是后来加用例时引入的。）
+     */
+    process.env.DSH_HOME = TEST_HOME
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('自动记忆：伙伴没配 autoMemory 时跟随全局（两种全局取值都跟）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'companion-follow-'))
+  const home = mkdtempSync(join(tmpdir(), 'companion-home-'))
+  process.env.DSH_HOME = home
+  try {
+    const paths = resolvePaths()
+    const companionDir = join(paths.companionsRoot, 'plain')
+    mkdirSync(companionDir, { recursive: true })
+    // 只有 name，没有 autoMemory
+    writeFileSync(join(companionDir, 'settings.json'), JSON.stringify({ name: '普通' }), 'utf8')
+    await writeBinding(paths, 's1', 'plain')
+
+    const longText = 'z'.repeat(2000)
+    const agent = {
+      id: 'a1',
+      session: {
+        id: 's1',
+        requestHeader: () => ({ config: { provider: 'p', model: 'm' } }),
+        snapshotEvents: () => [{ type: 'user/message', data: { content: [{ type: 'text', text: longText }], source: { kind: 'user' } } }],
+      },
+    }
+
+    // 全局关 → 跟随关
+    const ctxOff = makeCtx(dir)
+    writeSettings(paths, { autoMemory: false, reviewTurns: 1, reviewChars: 1 })
+    apply(ctxOff, {})
+    ctxOff.first('agent/turn-stopping')({ agent })
+    await tick()
+    assert.equal(ctxOff.stats.streams, 0, '没配覆盖时应跟随全局的 false')
+
+    // 全局开 → 跟随开
+    const ctxOn = makeCtx(dir)
+    writeSettings(paths, { autoMemory: true, reviewTurns: 1, reviewChars: 1 })
+    apply(ctxOn, {})
+    ctxOn.first('agent/turn-stopping')({ agent })
+    await tick()
+    assert.equal(ctxOn.stats.streams, 1, '没配覆盖时应跟随全局的 true')
+  } finally {
+    /*
+     * ⚠️ 必须还原成 TEST_HOME，**不能 delete**。
+     *
+     * `delete` 之后 `resolvePaths()` 会回落到真实的 `~/.dsh`，
+     * 而本文件后面还有大量 `writeSettings(resolvePaths(), …)` 的用例 ——
+     * 它们会**直接改写用户的真实配置**。（实测事故：2026-09-28 本机
+     * reviewTurns 被测试从 1 改成了 3。文件顶部那段隔离注释说的就是这个坑，
+     * 而那几处 `delete` 是后来加用例时引入的。）
+     */
+    process.env.DSH_HOME = TEST_HOME
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 test('自动记忆：关闭 autoMemory 时压缩不触发归档', async () => {

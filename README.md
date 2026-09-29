@@ -43,7 +43,7 @@
 
 ```
 <dshHome>/companion/companions/<id>/
-├── preset.yml           ← 昵称与个性签名
+├── settings.json        ← 昵称、签名、排序、工具收窄、自动记忆覆盖
 ├── SYSTEM.md            ┐
 ├── SOUL.md              │
 ├── IDENTITY.md          ├─ 按此顺序拼成唯一系统提示词
@@ -53,6 +53,32 @@
 ├── memory/              ← 按天日志（YYYY-MM-DD.md）
 └── changelog/           ← 记忆文件的改动留痕
 ```
+
+`settings.json` 可手工编辑（设置页只改昵称与签名，**不会**覆盖你写的其余键）：
+
+```json
+{
+  "name": "无限",
+  "description": "",
+  "order": 3,
+  "autoMemory": false,
+  "tools": { "allow": ["read", "read_image", "web_search", "web_fetch", "ask_user_question"] }
+}
+```
+
+| 键 | 作用 |
+|---|---|
+| `name` / `description` / `order` | 昵称、签名、排序（设置页管） |
+| `tools.allow` / `tools.deny` | **按伙伴收窄工具**。可写精确名或通配（`mnemon*`）。不写 = 全部可见 |
+| `autoMemory` | 覆盖全局自动记忆开关。不写 = 跟随设置页的全局值 |
+| `suppressRuntimeContext` | 屏蔽官方 runtime-context 注入块（工作区/权限策略那一大段）。`true` 才屏蔽 |
+
+> **`allow` 建议写精确的工具名。** 精确名直接交给官方校验（官方用 agent 作用域
+> 的完整名单），而我们本地能读到的名单只覆盖全局层 —— 拿它过滤会把预设层的
+> 工具（`read`/`write`/`web_search` 等）误杀。通配仍可用，但只在全局层展开。
+
+> 老版本的 `preset.yml` 会在首次列出伙伴时**自动迁移**成 `settings.json`，
+> 旧文件保留不删（作回滚依据）。
 
 > 从旧版本升级：伙伴原先在 `<dshHome>/.agent-presets/<id>/`，用
 > `node scripts/migrate-presets.mjs --apply` 搬迁（**只移动、不改内容**）。
@@ -282,7 +308,7 @@ provider/model），而不是全局默认模型——否则会话换过模型后
 | 行为 | 说明 |
 |---|---|
 | 编辑 Markdown | 每个文件一个页签，纯文本编辑（不引 Markdown 渲染库）。无改动时保存按钮禁用；**切换页签前若有未保存改动会先确认** |
-| 新建伙伴 | 用内置模板生成 6 个 Markdown + `preset.yml` + `memory/`（**不生成 bundle 声明**——所以无需装包、无需重启） |
+| 新建伙伴 | 用内置模板生成 6 个 Markdown + `settings.json` + `memory/`（**不生成 bundle 声明**——所以无需装包、无需重启） |
 | 复制伙伴 | 克隆内容与组合，不带历史日志 |
 | 删除 | 只移动到备份目录，不真删；新会话选不到，旧对话仍可查看。同时清掉所有指向该伙伴的会话绑定（否则重开那些会话会挂着一条指向已删目录的坏绑定） |
 | 参数 | 存 `<dshHome>/companion/settings.json`；改完点「保存」提交。**自动记忆与阈值实时生效**（下一个回合就按新值走，不必重启或重开会话） |
@@ -373,7 +399,7 @@ npm run check     # 语法检查
 | 改插件代码要重启 dsh | 已挂载的组合不会热替换模块 |
 | **伙伴增删不用重启** | 伙伴是插件自己的数据；新建/删除后刷新页面即可在下拉里看到 |
 | 官方 `context` 不受影响 | 独占只替换 **section**；沙箱策略、审批策略等运行期快照照常注入 |
-| `preset.yml` 只动三个键 | 昵称/签名写入时只替换 `name` / `description` / `order` 三行，**注释与其余字段原样保留**（用户可能手工加注释或加本项目不读的键）。昵称不写进 `agent.cordis.yml`——那里只是插件行清单 |
+| `settings.json` 只动三个键 | 昵称/签名写入时只更新 `name` / `description` / `order` 三个键，**`tools` 与 `autoMemory` 原样保留**——设置页改一次昵称不该抹掉你手工配的工具收窄 |
 | 设置页写入带冲突检测 | 保存 Markdown 时回传载入时的版本指纹；若后台自动记忆期间改过同一文件，服务端回 **409** 并提示重新载入，不会静默覆盖那条记忆 |
 | 本机 HTTP 接口有来源校验 | `/companion/api/*` 的写请求（POST/PUT/DELETE）校验 `Sec-Fetch-Site` 与 `Origin`，跨站一律 403；非浏览器客户端（curl 等）不受影响 |
 | 昵称 / 签名有长度上限 | 昵称 ≤ 60 字符、签名 ≤ 200 字符，超限报 400 |

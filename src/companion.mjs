@@ -37,6 +37,8 @@
  * 按 sessionId 索引；`companionFromEvents` 仅保留用于读**历史遗留**事件。
  */
 import { writeBinding } from './settings.mjs'
+// 伙伴目录的 settings.json（suppressRuntimeContext 等伙伴级开关）。
+import { readPresetMeta } from './index.js'
 import {
   DEFAULT_CONTEXT_BUDGET,
   COMPANION_PERSONA_ORDER,
@@ -45,6 +47,8 @@ import {
   contextBudgetNotice,
   contextFacts,
   createSessionFreeze,
+  applyToolRestriction,
+  normalizeToolFilter,
   measureContext,
   readAggregateText,
   sessionKeyOf,
@@ -160,6 +164,7 @@ export async function recordCompanionSelection(paths, sessionId, companion) {
 export function injectCompanionPrompt(ctx, dir, getSettings) {
   let disposeSection = null
   let disposeVariable = null
+  let disposeRuntimeContext = null
   let active = ''
 
   /*
@@ -185,8 +190,15 @@ export function injectCompanionPrompt(ctx, dir, getSettings) {
     // 先撤 section 再撤变量：顺序反了会在极短窗口里留下"引用了不存在的变量"的段。
     try { disposeSection?.() } catch { /* 已撤 */ }
     try { disposeVariable?.() } catch { /* 已撤 */ }
+    /*
+     * runtime-context 屏蔽也要撤 —— 它和 section 一样挂在 agent scope 的 layer 上
+     * （`layers.effect(this.ctx, …)`），不撤会在切走/换伙伴后继续生效，
+     * 表现为"换了伙伴、工作区信息还是不显示"。与工具收窄同一个教训。
+     */
+    try { disposeRuntimeContext?.() } catch { /* 已撤 */ }
     disposeSection = null
     disposeVariable = null
+    disposeRuntimeContext = null
     active = ''
     cache.clearAll()
   }
@@ -216,6 +228,23 @@ export function injectCompanionPrompt(ctx, dir, getSettings) {
         })
       },
     )
+    /*
+     * 屏蔽官方 runtime-context（可选，由伙伴自己的 settings.json 决定）。
+     *
+     * 官方 API：`ctx.systemPrompt.suppressRuntimeContext()`
+     * （dsh-system-prompt/lib/index.js:276）—— 效果与极简模式的
+     * `includeRuntimeContext: false` 相同（见 minimal.patch.yml:16）。
+     * 官方注释说多个 suppressor 各自独立可撤，所以我们只管自己的这一个。
+     *
+     * 每次 install 都**先撤再装**，避免重复叠加（虽然官方允许叠加，
+     * 但叠加意味着 disposal 计数不匹配，refresh 时容易漏撤）。
+     */
+    try { disposeRuntimeContext?.() } catch { /* 已撤 */ }
+    disposeRuntimeContext = null
+    if (readPresetMeta(nextDir).suppressRuntimeContext === true
+        && typeof ctx.systemPrompt?.suppressRuntimeContext === 'function') {
+      disposeRuntimeContext = ctx.systemPrompt.suppressRuntimeContext()
+    }
     active = nextDir
   }
 
@@ -230,4 +259,74 @@ export function injectCompanionPrompt(ctx, dir, getSettings) {
     dispose: clear,
     current: () => active,
   }
+}
+
+/**
+ * 在**会话自己的 scope** 里按伙伴收窄工具清单。
+ *
+ * ## 为什么必须在这里（而不是 preset 行插件里）
+ *
+ * `tools.restrict()` 官方**明确要求 agent scope**
+ * （`dsh-tools/lib/index.js:2897`）：
+ *
+ * > `tools.restrict() requires a scoped context (agent.ctx): a context-global
+ * >  restriction would mask every agent — deny the tool for the intended agent instead`
+ *
+ * 而 preset 行插件（`src/preset.js`）的 ctx 是 **preset scope**，同一预设下
+ * 所有会话共享——它表达不了"这是哪个伙伴"。这与提示词注入面临的是同一个问题，
+ * 所以两者用同一个落点、同一个 ctx（见 index.js 的 `agent/created`）。
+ *
+ * ## 历史
+ *
+ * 早先这段收窄在 `preset.js` 的 apply 里，config 由 `agent.cordis.yml` 模板的
+ * 一行声明传入。rc2 改造成"所有伙伴共用一个声明式预设"之后，那一行不再挂载，
+ * `config.tools` 恒为空 —— 收窄**静默失效**（`deny: ['mnemon*']` 不再生效）。
+ * 搬到这里之后，数据源改为**当前伙伴自己的 `settings.json`**，
+ * 既修好了那个回归，也让每个伙伴能各不相同。
+ *
+ * ## 语义
+ *
+ * - 伙伴没配 `tools`（或写了空对象）→ **不注册任何 restriction**，工具全可见；
+ * - 配了 `allow` / `deny` → 交给 `applyToolRestriction` 展开通配并下发。
+ *
+ * 失败**不抛**：收窄是优化，不该让会话起不来。与 `injectCompanionPrompt`
+ * 的取舍一致。
+ *
+ * @param {object} ctx - **会话 scope** 的上下文（有 tools）。
+ * @param {object|undefined} tools - 伙伴 settings.json 里的 tools 字段。
+ * @param {object} [logger] - 可选 logger。
+ * @returns {{applied: boolean, filter?: object, reason?: string, unmatched?: string[]}}
+ */
+export function restrictCompanionTools(ctx, tools, logger) {
+  /*
+   * 未配置时**也要留一行 info**：这条早返回原本完全静默，
+   * 排查"收窄没生效"时无法区分「伙伴没配 tools」与「配置没读到」。
+   */
+  if (!tools || typeof tools !== 'object') {
+    logger?.info?.('[companion] 工具收窄跳过：该伙伴未配置 tools')
+    return { applied: false, reason: '未配置工具收窄' }
+  }
+  /*
+   * 归一化后再下发：`applyToolRestriction` 读的是 `{allow: [], deny: []}` 形态
+   * （两者都存在、都是数组），而 settings.json 里用户可能只写一个键、甚至写错类型。
+   * normalizeToolFilter 负责去重、去空白、剔除非字符串。
+   *
+   * 不再自己判"空就不下发"——`applyToolRestriction` 内部已经这么做了
+   * （core.js 的 `if (filter.allow === undefined && filter.deny === undefined)`
+   * 返回 applied:false）。重复一道只会让两条守卫将来各自漂移。
+   */
+  const result = applyToolRestriction(ctx, normalizeToolFilter(tools))
+  if (result.applied) {
+    const bits = []
+    if (result.filter?.allow?.length) bits.push(`allow=${result.filter.allow.join(',')}`)
+    if (result.filter?.deny?.length) bits.push(`deny=${result.filter.deny.join(',')}`)
+    logger?.info?.(`[companion] 工具收窄已生效：${bits.join(' ')}`)
+  } else if (result.reason) {
+    // 真实异常一并打出：收窄失败会静默放行全部工具，只写一句散文查不出根因。
+    logger?.warn?.(`[companion] 工具收窄未生效：${result.reason}`)
+  }
+  if (result.unmatched?.length) {
+    logger?.warn?.(`[companion] 以下工具模式未匹配到任何可见工具：${result.unmatched.join(', ')}`)
+  }
+  return result
 }

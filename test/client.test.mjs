@@ -79,6 +79,8 @@ function makeStatefulReact() {
   let rendering = false
   /** effect 回调排队：真实 React 在 commit 之后跑，不能在渲染过程中同步跑。 */
   const pendingEffects = []
+  /** 已执行过的 effect 回调，供 unmount() 调用它们返回的清理函数。 */
+  const pendingCleanups = []
   const rerender = () => {
     if (!component) return
     const tree = render()
@@ -122,6 +124,10 @@ function makeStatefulReact() {
         slots[i] = true
         // 排队到本次渲染结束之后执行（模拟 commit 后的 effect）
         pendingEffects.push(fn)
+        // 真实 React 在卸载/依赖变化时会调用 effect 返回的清理函数。
+        // 这里记下来，交给 unmount() 调用——不然"卸载不清理"这类泄漏
+        // 在桩里永远看不见（effect 的 return 值被直接丢弃）。
+        pendingCleanups.push(fn)
       }
     },
     useCallback: (fn) => {
@@ -142,6 +148,7 @@ function makeStatefulReact() {
     slots = []
     props = {}
     pendingEffects.length = 0
+    pendingCleanups.length = 0
     const tree = render()
     drain()
     return tree
@@ -154,7 +161,28 @@ function makeStatefulReact() {
     }
     return render()
   }
-  return { React, mount, rerender, flush }
+  /**
+   * 卸载：调用每个已执行 effect 返回的清理函数（真实 React 的 unmount 语义）。
+   *
+   * 桩原先只排队执行 effect，把返回值丢掉——于是「effect 里注册了定时器
+   * 却没有清理」这类泄漏在测试里完全不可见。这个入口就是为它准备的。
+   * @returns 实际调用到的清理函数个数。
+   */
+  const unmount = () => {
+    component = null
+    let count = 0
+    for (const fn of pendingCleanups) {
+      const cleanup = fn()
+      if (typeof cleanup === 'function') {
+        cleanup()
+        count += 1
+      }
+    }
+    pendingCleanups.length = 0
+    pendingEffects.length = 0
+    return count
+  }
+  return { React, mount, rerender, flush, unmount }
 }
 
 /** 在渲染树里深度查找满足条件的节点。 */
@@ -1273,4 +1301,216 @@ test('伙伴下拉：失败提示可点击清除并回到正常下拉', async ()
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+/* ------------------------------------------------------------------ *
+ * 对照 omdsh-chatmode 审出的三处缺口（2026-09-28）
+ *
+ * 借鉴来源：github.com/omdsh-plugins/omdsh-chatmode（src/client/pin.ts、
+ * hero-picker.ts）。它的 settle() 有两个我们没做到的性质：
+ *   ① 每个 effect 都有清理函数，卸载后不留东西；
+ *   ② "试过一次的顺序不重试" —— 失败不变成自旋。
+ * 我们这边对应的是 pickErrorTimer 与 useSessionPreset 的订阅开销。
+ * ------------------------------------------------------------------ */
+
+test('伙伴下拉：卸载时必须清掉失败提示定时器（否则回调打到已卸载组件）', async () => {
+  /*
+   * 缺口：pickErrorTimer 只在"再次 pick"时 clearTimeout，effect 没有
+   * 返回清理函数。下拉随会话切换被卸载后，5 秒计时器仍会触发 setState，
+   * 对已卸载组件 setState 在真实 React 里是空操作 + 警告，
+   * 在并发模式下更是状态更新的竞态来源。
+   *
+   * 断言方式：桩里 unmount 会调用 effect 返回的清理函数；
+   * 清理后让假计时器推进，若仍触发说明没清干净。
+   */
+  const picker = mountPickerWithPut({ putFails: true })
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  const scheduled = new Map()
+  const cleared = []
+  let nextId = 1
+  try {
+    // 假计时器：记录注册与清除，手动推进
+    globalThis.setTimeout = (fn, ms) => { const id = nextId++; scheduled.set(id, fn); return id }
+    globalThis.clearTimeout = (id) => { cleared.push(id); scheduled.delete(id) }
+
+    picker.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    const stub = menuStubOf(picker.runtime.flush())
+    await stub.props.onSelect('lily')
+    await new Promise((resolve) => setImmediate(resolve))
+
+    assert.equal(scheduled.size, 1, '失败后应注册一个自动清除定时器')
+    const timerId = [...scheduled.keys()][0]
+
+    // 卸载组件：真实 React 此时会跑 effect 的清理函数
+    picker.runtime.unmount()
+
+    assert.ok(
+      cleared.includes(timerId),
+      '卸载时 effect 的清理函数必须 clearTimeout(pickErrorTimer.current) —— 否则定时器泄漏到卸载之后',
+    )
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+    globalThis.clearTimeout = realClearTimeout
+    picker.restore()
+  }
+})
+
+test('伙伴下拉：失败提示的计时器在重新 pick 时不被重复堆积', async () => {
+  /*
+   * 已有防护：pick() 里 `if (pickErrorTimer.current) clearTimeout(...)`。
+   * 这条锁住它，避免将来重构时把守卫删掉导致连续失败堆积多个计时器。
+   */
+  const picker = mountPickerWithPut({ putFails: true })
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  const live = new Set()
+  let nextId = 1
+  try {
+    globalThis.setTimeout = () => { const id = nextId++; live.add(id); return id }
+    globalThis.clearTimeout = (id) => { live.delete(id) }
+
+    picker.mount()
+    await new Promise((resolve) => setImmediate(resolve))
+    const stub1 = menuStubOf(picker.runtime.flush())
+    await stub1.props.onSelect('lily')
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(live.size, 1, '首次失败注册一个计时器')
+
+    // 第二次失败：应清掉旧的再注册新的，而不是并存两个
+    const stub2 = menuStubOf(picker.runtime.flush())
+    if (stub2) {
+      await stub2.props.onSelect('lily')
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(live.size, 1, '连续失败不应堆积计时器（旧的必须先被清除）')
+    }
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+    globalThis.clearTimeout = realClearTimeout
+    picker.restore()
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * 第四处：useSession 订阅了整个快照，而我们只用两个布尔字段
+ *
+ * 官方各 UI 包一律选窄字段（trajectory 选 loadingOlder/hasMore、
+ * schedule 选 openState…，见 dsh-client-ui-trajectory/lib/client.js:8365-8367）。
+ * 我们写的是 `useSession((snapshot) => snapshot)` —— 返回整对象，
+ * 于是流式输出期间每次 token 更新都会让这个挂在输入栏的控件重渲染。
+ *
+ * 这条测试比的是**两个 selector 的返回值**，不接真实宿主：
+ * 模拟"会话快照换了、但两个字段没变"，看订阅是否被判定为相等。
+ * 参考实现的相等语义就是浅比较（值不变 → 不重渲染）。
+ * ------------------------------------------------------------------ */
+
+test('伙伴下拉：useSession 只订阅用得到的字段，不订阅整个快照', async () => {
+  /*
+   * 做法：抓取 CompanionPicker 真正传给 useSession 的 selector，
+   * 对两个"不相关字段不同、两个相关字段相同"的快照求值，
+   * 断言两次结果在浅比较下相等。
+   *
+   * 若 selector 是 (snapshot) => snapshot，两次结果是两个不同对象 → 不等 → 红；
+   * 若 selector 只挑 {blank, promptAttempted}，值相同即相等 → 绿。
+   */
+  const selectors = []
+  const runtime = makeStatefulReact()
+  const { CompanionPicker } = introspectWith(runtime.React)
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ companions: [{ id: 'lily', name: '莉莉' }], current: null }) })
+  try {
+    // useSession 桩：记录 selector 并返回其求值结果（不做重渲染判定）
+    let useSessionCalls = 0
+    const useSession = (selector) => {
+      useSessionCalls += 1
+      if (selector) selectors.push(selector)
+      return selector ? selector({ sessionId: 's1', blank: true, promptAttempted: false, streaming: 'x' }) : undefined
+    }
+    const useSessions = (selector) => selector({ byId: { s1: { projectionValues: { agentPreset: 'companion-mode' } } } })
+
+    runtime.mount(() => CompanionPicker({ sessionId: 's1', useSession, useSessions }))
+    await new Promise((resolve) => setImmediate(resolve))
+    runtime.flush()
+
+    assert.ok(useSessionCalls > 0, '组件应调用 useSession')
+    const selector = selectors[0]
+
+    // 两个快照：只有不相关字段不同
+    const a = selector({ sessionId: 's1', blank: true, promptAttempted: false, streaming: 'aaa', other: 1 })
+    const b = selector({ sessionId: 's1', blank: true, promptAttempted: false, streaming: 'bbb', other: 2 })
+
+    const shallowEqual = (x, y) => {
+      if (Object.is(x, y)) return true
+      if (typeof x !== 'object' || typeof y !== 'object' || x === null || y === null) return false
+      const kx = Object.keys(x); const ky = Object.keys(y)
+      if (kx.length !== ky.length) return false
+      return kx.every((k) => Object.is(x[k], y[k]))
+    }
+
+    assert.ok(
+      shallowEqual(a, b),
+      '不相关字段变化时 selector 结果必须相等（否则流式输出每个 token 都触发本控件重渲染）——' +
+      '应选 {blank, promptAttempted} 而非整个快照',
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * 第五处：会话字段缺失时被当成"可改绑定"
+ *
+ * omdsh-chatmode 把状态显式分成三态并给出 `ready`
+ * （`const next = { mode, ready: chat !== undefined }`），未就绪与
+ * "没有"是两件事。
+ *
+ * 我们的 canPickCompanion 是"字段缺失 = 放行"：
+ *   if (!session) return false            ← 整个快照为 undefined 才锁
+ *   if (session.blank === false) return false
+ *   if (session.promptAttempted === true) return false
+ *   return true                           ← {} 会走到这里 → true
+ * 也就是说 `{}`（快照已存在但字段没装上）被判为"可选"。
+ *
+ * 后果：输入栏会渲染出**可交互**的下拉，而此刻 blank/promptAttempted
+ * 都还没有权威值——一个其实已经开始的会话，在这个窗口里可被改绑定，
+ * 而服务端会以 409 拒绝（W8 那条错误提示正是这么来的）。
+ * ------------------------------------------------------------------ */
+
+/**
+ * 抽取并求值 client 里的 canPickCompanion。
+ *
+ * 直接对它求值而不是"渲染后看有没有按钮"——后者会被渲染时序掩盖：
+ * fetch 还没 resolve 时 phase='loading' 本来就 return null，
+ * 于是无论判定对不对都看不到按钮（第一版测试就是这样假绿的）。
+ * @returns 判定函数本身。
+ */
+function captureCanPick() {
+  const match = SOURCE.match(/function canPickCompanion\(session\) \{[\s\S]*?\n {4}\}/)
+  assert.ok(match, 'client.js 里应能找到 canPickCompanion')
+  // eslint-disable-next-line no-eval
+  return eval(`(${match[0].replace('function canPickCompanion', 'function')})`)
+}
+
+test('伙伴下拉：字段缺失不应冒充"可改绑定"（未就绪 ≠ 可选）', async () => {
+  /*
+   * 用 captureCanPick 直接抽取并求值 canPickCompanion，避免被渲染
+   * 时序（fetch 未 resolve 时 phase=loading 恰好 return null）掩盖——
+   * 第一版测试就是这么假绿的，实际断言不到任何东西。
+   */
+  const canPick = captureCanPick()
+
+  assert.equal(canPick(undefined), false, '整个快照缺失 → 锁定')
+  assert.equal(canPick({ blank: false }), false, '会话已开始 → 锁定')
+  assert.equal(canPick({ blank: true, promptAttempted: true }), false, '首轮已提交 → 锁定')
+  assert.equal(canPick({ blank: true, promptAttempted: false }), true, '尚未开始 → 可选')
+
+  // 这一条是缺口本身：快照在、但两个字段都没装上
+  assert.equal(
+    canPick({}),
+    false,
+    '快照字段缺失（未就绪）应锁定：blank/promptAttempted 都无权威值时，' +
+    '放行会让已开始的会话在这个窗口里被改绑定，服务端再以 409 拒绝',
+  )
 })

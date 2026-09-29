@@ -1,5 +1,6 @@
 /**
- * Host 半（src/index.js）单测：preset.yml 读写、伙伴增删查、备份、日记、设置。
+ * Host 半（src/index.js）单测：settings.json 读写、伙伴增删查、备份、日记、设置、
+ * 以及**预设切换时的按伙伴工具收窄**。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -10,6 +11,7 @@ import { join } from 'node:path'
 import {
   DEFAULT_SETTINGS,
   archiveAgent,
+  apply,
   copyAgent,
   createAgent,
   generateId,
@@ -27,6 +29,8 @@ import {
   writePresetMeta,
   writeSettings,
 } from '../src/index.js'
+// 绑定表写入是异步的（共用按路径队列），本组用例要 await。
+import { writeBinding } from '../src/settings.mjs'
 import { PRESET_FILES, agentCordisTemplate, renderAllTemplates, renderTemplate } from '../src/templates.mjs'
 import { DEFAULT_FILES } from '../src/core.js'
 
@@ -49,161 +53,146 @@ test('resolvePaths：显式 home 优先，DSH_HOME 次之', () => {
   assert.equal(resolvePaths('D:/explicit').dshHome, 'D:/explicit')
 })
 
-test('preset.yml 往返：写入 name/description/order，读回一致', () => {
+test('settings.json 往返：写入 name/description/order，读回一致', () => {
   const { home, paths } = makeHome()
   const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   writePresetMeta(dir, { name: '小花', description: '温柔但直接', order: 3 })
   const meta = readPresetMeta(dir)
-  assert.deepEqual(meta, { name: '小花', description: '温柔但直接', order: 3 })
-  rmSync(home, { recursive: true, force: true })
-})
-
-test('preset.yml：缺失 order 读成 undefined，不是 0', () => {
-  const { home, paths } = makeHome()
-  const dir = join(paths.companionsRoot, 'demo')
-  mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'preset.yml'), 'name: 小花\ndescription: 无 order\n', 'utf8')
-  const meta = readPresetMeta(dir)
-  assert.equal(meta.order, undefined, 'Number("") === 0 会让无 order 的伙伴插到最前面')
   assert.equal(meta.name, '小花')
-
-  // 文件完全不存在时同样是 undefined
-  const empty = join(paths.companionsRoot, 'empty')
-  mkdirSync(empty, { recursive: true })
-  assert.equal(readPresetMeta(empty).order, undefined)
+  assert.equal(meta.description, '温柔但直接')
+  assert.equal(meta.order, 3)
+  assert.equal(meta.tools, undefined, '没配 tools 时必须是 undefined（= 不限制）')
+  assert.equal(meta.autoMemory, undefined, '没配 autoMemory 时必须是 undefined（= 跟随全局）')
   rmSync(home, { recursive: true, force: true })
 })
 
-test('preset.yml：无 order 的伙伴排序不应被当成 0 插到最前', () => {
-  const { home, paths } = makeHome()
-  const withOrder = createAgent(paths, { name: '有序号' })       // order 0
-  const dir = join(paths.companionsRoot, 'no-order')
-  mkdirSync(dir, { recursive: true })
-  writePresetMeta(dir, { name: '无序号', order: undefined })      // 写入 order: 0 是刻意的（写全字段）
-  writeFileSync(join(dir, 'preset.yml'), 'name: 无序号\n', 'utf8') // 再抹掉 order 模拟外部创建
-
-  const rows = listAgents(paths)
-  assert.equal(rows[0].id, withOrder.id, '有明确 order 的排前面')
-  assert.equal(rows[1].id, 'no-order')
-  assert.equal(rows[1].order, Number.MAX_SAFE_INTEGER, '无 order 用哨兵值排到末尾')
-  rmSync(home, { recursive: true, force: true })
-})
-
-test('preset.yml：值含冒号/引号/反斜杠/换行都能原样往返', () => {
+test('settings.json：缺失 order 读成 undefined，不是 0', () => {
   const { home, paths } = makeHome()
   const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
-  const cases = [
-    '莉莉: 副手',
-    'a"b',
-    'a:b\\c',          // 单个反斜杠
-    'a:b\\\\c',        // 两个反斜杠：曾经会被 unquote 吃掉一个
-    'C:\\path\\to',
-    '第一行\n第二行',    // 换行曾经会破坏文件结构
-    '带 # 井号',
-    ' 前后有空格 ',
-    '# 井号开头',
-    '- 短横开头',
-    '空字符串测试以外的普通文本',
-  ]
-  for (const value of cases) {
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ name: '小花', description: '无 order' }), 'utf8')
+  const meta = readPresetMeta(dir)
+  assert.equal(meta.order, undefined, '缺 order 必须读成 undefined，写 0 会让它插到最前面')
+  assert.equal(meta.name, '小花')
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('settings.json：损坏/非对象/缺失一律静默返回空配置，绝不抛', () => {
+  /*
+   * 一个伙伴的元数据坏掉不该让整个伙伴列表读不出来。
+   * 旧实现靠 YAML 正则天然容错；换成 JSON.parse 后必须显式接住语法错误。
+   */
+  const { home, paths } = makeHome()
+  const dir = join(paths.companionsRoot, 'broken')
+  mkdirSync(dir, { recursive: true })
+
+  writeFileSync(join(dir, 'settings.json'), '{ 这不是 JSON', 'utf8')
+  assert.equal(readPresetMeta(dir).name, '', '语法错误 → 空配置而不是抛')
+  assert.equal(readPresetMeta(dir).order, undefined)
+
+  writeFileSync(join(dir, 'settings.json'), '"一个字符串"', 'utf8')
+  assert.equal(readPresetMeta(dir).name, '', '顶层非对象 → 空配置')
+
+  writeFileSync(join(dir, 'settings.json'), 'null', 'utf8')
+  assert.equal(readPresetMeta(dir).name, '', '顶层 null → 空配置')
+
+  rmSync(join(dir, 'settings.json'), { force: true })
+  assert.equal(readPresetMeta(dir).name, '', '文件不存在 → 空配置')
+
+  // 列表仍然读得出来（该伙伴以 id 兜底显示）
+  const rows = listAgents(paths)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].name, 'broken', '无 name 时回落 id')
+  rmSync(home, { recursive: true, force: true })
+})
+
+test('settings.json：值含冒号/引号/反斜杠/换行都能原样往返', () => {
+  /*
+   * 旧实现要为此维护 quote/unquote 两个函数；JSON.stringify 自带转义，
+   * 这条测试从"验证我们的转义实现"变成"验证我们没有绕开 JSON"。
+   */
+  const { home, paths } = makeHome()
+  const dir = join(paths.companionsRoot, 'demo')
+  mkdirSync(dir, { recursive: true })
+  for (const value of ['带: 冒号', 'has "quotes"', 'back\\slash', 'line\nbreak', "单引号's", 'tab\there']) {
     writePresetMeta(dir, { name: value, description: value, order: 1 })
     const meta = readPresetMeta(dir)
-    assert.equal(meta.name, value, `name 往返失败：${JSON.stringify(value)}`)
-    assert.equal(meta.description, value, `description 往返失败：${JSON.stringify(value)}`)
-    assert.equal(meta.order, 1)
-    // 单行文件：换行必须被转义，不能真的断行
-    const lines = readFileSync(join(dir, 'preset.yml'), 'utf8').trimEnd().split('\n')
-    assert.equal(lines.length, 3, `preset.yml 应始终是 3 行：${JSON.stringify(value)}`)
+    assert.equal(meta.name, value, `往返失败：${JSON.stringify(value)}`)
+    assert.equal(meta.description, value)
   }
   rmSync(home, { recursive: true, force: true })
 })
 
-test('preset.yml：有值的字段照常写，order 0 也保留', () => {
+test('settings.json：有值的字段照常写，order 0 也保留', () => {
   const { home, paths } = makeHome()
   const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
   writePresetMeta(dir, { name: 'x', description: '', order: 0 })
-  const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
-  assert.ok(text.includes('name: x'))
-  /*
-   * 空的 description **不新增该行**（遵循「没设过就不落行」的约定，
-   * 与 order 一致）；但原文里已有该行时仍会更新成 `""`。
-   * 见 writePresetMeta 的注释。
-   */
-  assert.ok(!text.includes('description:'), '原文没有 description 时不该凭空补一行空值')
-  assert.ok(text.includes('order: 0'))
+  const parsed = JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8'))
+  assert.equal(parsed.order, 0, 'order 0 必须落盘，不能被当成 falsy 丢掉')
   assert.equal(readPresetMeta(dir).order, 0, 'order 0 必须保留，不能回落 undefined')
   rmSync(home, { recursive: true, force: true })
 })
 
-test('preset.yml：只替换三个已知键，注释与其余字段原样保留', () => {
+test('settings.json：改昵称不动 tools / autoMemory（设置页不该抹掉手工配置）', () => {
+  /*
+   * 设置页只提交 name / description；而 tools 与 autoMemory 是用户手工编辑的。
+   * 写入必须是**部分更新**：其余键原样保留，否则改一次昵称就把工具收窄和
+   * 记忆开关一起抹掉——这正是旧 preset.yml 时代踩过的坑（注释与未知键被抹）。
+   */
   const { home, paths } = makeHome()
   const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
-  /*
-   * preset.yml 是从"伙伴即官方预设目录"时代继承的格式，用户会手工往里放
-   * 本项目不读的键（id / model / tools）与注释。整文件重写会把这些静默抹掉
-   * ——这条锁住「不抹」。
-   */
-  writeFileSync(join(dir, 'preset.yml'), [
-    '# 手工注释',
-    'name: 莉莉',
-    'description: 温柔但直接',
-    'order: 3',
-    'id: lili-personal',
-    'model: deepseek-v4',
-    'tools:',
-    '  deny:',
-    '    - bash',
-    '',
-  ].join('\n'), 'utf8')
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({
+    name: '莉莉',
+    description: '温柔但直接',
+    order: 3,
+    autoMemory: false,
+    tools: { allow: ['read', 'web_search'] },
+    // 不认识的键：JSON 没有注释要保护，但读写都该无视而不是炸
+    unknownKey: 'ignored',
+  }, null, 2), 'utf8')
 
   writePresetMeta(dir, { name: '莉莉2', description: '温柔但直接', order: 3 })
-  const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
-  assert.ok(text.includes('name: 莉莉2'), '昵称应被替换')
-  assert.ok(text.includes('# 手工注释'), '注释必须保留')
-  assert.ok(text.includes('id: lili-personal'), '未知字段必须保留')
-  assert.ok(text.includes('model: deepseek-v4'), '未知字段必须保留')
-  assert.ok(text.includes('    - bash'), '嵌套结构必须保留')
+  const meta = readPresetMeta(dir)
+  assert.equal(meta.name, '莉莉2', '昵称应被替换')
+  assert.equal(meta.autoMemory, false, 'autoMemory 必须原样保留')
+  assert.deepEqual(meta.tools, { allow: ['read', 'web_search'] }, 'tools 必须原样保留')
   rmSync(home, { recursive: true, force: true })
 })
 
-test('preset.yml：会被 YAML 隐式类型化的值强制加引号', () => {
+test('settings.json：autoMemory 只认布尔，写别的类型当没写（跟随全局）', () => {
+  /*
+   * 猜一个真值比"不覆盖"危险：猜错会让伙伴静默不记忆，或静默狂写日记。
+   * 所以 "true" / 1 / null 一律当没配。
+   */
   const { home, paths } = makeHome()
   const dir = join(paths.companionsRoot, 'demo')
   mkdirSync(dir, { recursive: true })
-  /*
-   * 官方用 js-yaml 读这个文件，未加引号的 123 / true / null / 2026-09-13
-   * 会被读成 number / boolean / null / Date，而官方对非字符串的 name 是
-   * **静默降级成 undefined**（回落显示 id）——不报错，只丢昵称。
-   */
-  for (const value of ['123', 'true', 'null', '~', '2026-09-13', '1.5']) {
-    writePresetMeta(dir, { name: value, description: value, order: 1 })
-    const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
-    assert.ok(
-      text.includes(`name: "${value}"`),
-      `${JSON.stringify(value)} 必须加引号写出，实际：${text.split('\n')[0]}`,
-    )
-    // 本插件的读法本身对称，改引号不影响它
-    assert.equal(readPresetMeta(dir).name, value)
+  for (const value of ['true', 1, 0, null, {}, []]) {
+    writeFileSync(join(dir, 'settings.json'), JSON.stringify({ name: 'x', autoMemory: value }), 'utf8')
+    assert.equal(readPresetMeta(dir).autoMemory, undefined, `${JSON.stringify(value)} 不是布尔，应视为没配`)
+  }
+  for (const value of [true, false]) {
+    writeFileSync(join(dir, 'settings.json'), JSON.stringify({ name: 'x', autoMemory: value }), 'utf8')
+    assert.equal(readPresetMeta(dir).autoMemory, value, `${value} 是布尔，应原样读回`)
   }
   rmSync(home, { recursive: true, force: true })
 })
 
-test('preset.yml：缺 order 的伙伴改名后不该被写成 order: 0', () => {
+test('settings.json：缺 order 的伙伴改名后不该被写成 order 0', () => {
   const { home, paths } = makeHome()
   const dir = join(paths.companionsRoot, 'manual')
   mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'preset.yml'), 'name: 手工\n', 'utf8')
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ name: '手工' }), 'utf8')
 
   const current = readPresetMeta(dir)
   assert.equal(current.order, undefined, '缺 order 应读成 undefined')
   writePresetMeta(dir, { name: '手工2', description: current.description, order: current.order })
 
-  const text = readFileSync(join(dir, 'preset.yml'), 'utf8')
-  assert.ok(!text.includes('order:'), 'order 为 undefined 时不该补一行（写 0 会排到最前）')
+  const parsed = JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8'))
+  assert.ok(!('order' in parsed), 'order 为 undefined 时不该落键（写 0 会排到最前）')
   assert.equal(readPresetMeta(dir).order, undefined)
   // 排序哨兵：没有 order 的排最后（与官方 order ?? Infinity 一致）
   const rows = listAgents(paths)
@@ -211,16 +200,48 @@ test('preset.yml：缺 order 的伙伴改名后不该被写成 order: 0', () => 
   rmSync(home, { recursive: true, force: true })
 })
 
-test('preset.yml：CRLF 文件改写后仍是 CRLF', () => {
+test('迁移：preset.yml → settings.json，保留旧文件，字段对齐', () => {
+  /*
+   * 存量伙伴目录里是 preset.yml。迁移必须：
+   * ① 把三个字段搬到 JSON；② **保留旧文件**（用户手工写过的东西留作回滚依据）。
+   */
   const { home, paths } = makeHome()
-  const dir = join(paths.companionsRoot, 'crlf')
+  const dir = join(paths.companionsRoot, 'legacy')
   mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'preset.yml'), 'name: 甲\r\norder: 1\r\n', 'utf8')
-  writePresetMeta(dir, { name: '乙', order: 1 })
-  const raw = readFileSync(join(dir, 'preset.yml'), 'utf8')
-  assert.ok(raw.includes('\r\n'), '必须保留 CRLF，否则 Windows 上整文件 diff 爆炸')
-  assert.ok(!/[^\r]\n/.test(raw), '不该混入裸 LF')
-  assert.equal(readPresetMeta(dir).name, '乙')
+  writeFileSync(join(dir, 'preset.yml'), [
+    '# 手工注释',
+    'name: 莉莉',
+    'description: 温柔但直接',
+    'order: 3',
+    'tools:',
+    '  deny:',
+    '    - mnemon*',
+    '',
+  ].join('\n'), 'utf8')
+
+  const meta = readPresetMeta(dir)
+  assert.equal(meta.name, '莉莉', '迁移前应能回落读 preset.yml')
+  assert.equal(meta.description, '温柔但直接')
+  assert.equal(meta.order, 3)
+
+  // 触发迁移（listAgents 会对每个伙伴目录调用迁移）
+  listAgents(paths)
+  const parsed = JSON.parse(readFileSync(join(dir, 'settings.json'), 'utf8'))
+  assert.equal(parsed.name, '莉莉')
+  assert.equal(parsed.description, '温柔但直接')
+  assert.equal(parsed.order, 3)
+  assert.ok(existsSync(join(dir, 'preset.yml')), '旧文件必须保留，作回滚依据')
+  assert.equal(readPresetMeta(dir).name, '莉莉', '迁移后仍读得到')
+
+  // 幂等：再跑一次不改动已存在的 settings.json
+  const before = readFileSync(join(dir, 'settings.json'), 'utf8')
+  listAgents(paths)
+  assert.equal(readFileSync(join(dir, 'settings.json'), 'utf8'), before, '迁移必须幂等')
+
+  // 已有 settings.json 时的覆盖保护：不再被 preset.yml 回改
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify({ name: '新名字' }), 'utf8')
+  listAgents(paths)
+  assert.equal(readPresetMeta(dir).name, '新名字', 'settings.json 优先，不被旧文件覆盖')
   rmSync(home, { recursive: true, force: true })
 })
 
@@ -247,7 +268,7 @@ test('generateId：ASCII 名转 slug，中文名回落 companion-', () => {
   assert.notEqual(generateId('a', existing), first)
 })
 
-test('createAgent：生成 6 个 MD + preset.yml + memory 目录', () => {
+test('createAgent：生成 6 个 MD + settings.json + memory 目录', () => {
   const { home, paths } = makeHome()
   const agent = createAgent(paths, { name: '小花', description: '温柔但直接' })
   assert.equal(agent.name, '小花')
@@ -257,7 +278,7 @@ test('createAgent：生成 6 个 MD + preset.yml + memory 目录', () => {
     assert.ok(existsSync(join(paths.companionsRoot, agent.id, file)), `${file} 应落盘`)
   }
   assert.ok(existsSync(join(paths.companionsRoot, agent.id, 'memory')))
-  assert.ok(existsSync(join(paths.companionsRoot, agent.id, 'preset.yml')))
+  assert.ok(existsSync(join(paths.companionsRoot, agent.id, 'settings.json')))
 
   assert.ok(agent.files['IDENTITY.md'].includes('小花'))
   rmSync(home, { recursive: true, force: true })
@@ -631,7 +652,7 @@ test('createAgent / copyAgent：不再产出 bundle 声明（伙伴是插件自�
   const dir = join(paths.companionsRoot, agent.id)
   assert.ok(!existsSync(join(dir, 'cordis.patch.yml')), '不该再有 bundle patch')
   assert.ok(!existsSync(join(dir, 'package.json')), '不该再有 bundle package.json')
-  assert.ok(existsSync(join(dir, 'preset.yml')), 'preset.yml 仍要写（昵称/签名/排序）')
+  assert.ok(existsSync(join(dir, 'settings.json')), 'settings.json 仍要写（昵称/签名/排序）')
 
   const copy = copyAgent(paths, agent.id, { name: '副本' })
   const copyDir = join(paths.companionsRoot, copy.id)
@@ -639,4 +660,531 @@ test('createAgent / copyAgent：不再产出 bundle 声明（伙伴是插件自�
   assert.ok(existsSync(join(copyDir, 'SOUL.md')), '副本仍应带六个 MD')
   assert.equal(readAgent(paths, copy.id).name, '副本')
   rmSync(home, { recursive: true, force: true })
+})
+
+/* ------------------------------------------------------------------ *
+ * 预设切换路径也要装工具收窄（2026-09-28 实测事故）
+ *
+ * 事故：一个 09-27 建的历史会话，今天在界面上把预设切成「伙伴模式」——
+ * 人设装上了、**工具收窄没生效**，请求头里仍是 34 个工具
+ * （含 write / edit / pwsh / mcp__dbx__*）。
+ *
+ * 两个根因，都在这一组里锁住：
+ * ① 收窄当时只注册在 `agent/created`，而这台会话走的是另一条事件
+ *    `agent-preset/selected`；
+ * ② 那条分支原本用 `injections.has(sessionId)` 做统一 early return ——
+ *    会话在 agent/created 时若已带绑定，注入已存在，整段被跳过，
+ *    于是**连装上收窄的机会都没有**。
+ *
+ * 必须经由 host 半真实 apply() + 事件流驱动。直接测
+ * restrictCompanionTools() 只能验证函数本身，测不出"哪条路径没接上"。
+ * ------------------------------------------------------------------ */
+
+/** host 半的最小 ctx：只实现 apply() 真正用到的东西。 */
+function makeHostCtx() {
+  const listeners = new Map()
+  const restricted = []
+  const logs = { info: [], warn: [] }
+  return {
+    restricted,
+    logs,
+    baseUrl: undefined,
+    on(event, handler) {
+      const list = listeners.get(event) ?? []
+      list.push(handler)
+      listeners.set(event, list)
+      return () => {}
+    },
+    emit(event, ...args) {
+      for (const handler of listeners.get(event) ?? []) handler(...args)
+    },
+    get: () => undefined,
+    effect: (fn) => fn(),
+    // 路由注册需要：给个空实现即可，本组不验 HTTP
+    webServer: { register: () => {} },
+    logger: {
+      info: (m) => logs.info.push(String(m)),
+      warn: (m) => logs.warn.push(String(m)),
+    },
+    tools: {
+      register() {},
+      view: () => ({ restrictableNames: new Set(['read', 'web_search', 'ask_user_question', 'write', 'edit', 'pwsh']) }),
+      restrict(filter) { restricted.push(filter) },
+    },
+  }
+}
+
+test('预设切换：在既有会话上切到伙伴模式也要装工具收窄（事故回归）', async () => {
+  const { home, paths } = makeHome()
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const companionDir = join(paths.companionsRoot, 'chatty')
+    mkdirSync(companionDir, { recursive: true })
+    writePresetMeta(companionDir, { name: '聊天', tools: { allow: ['read', 'web_search', 'ask_user_question'] } })
+
+    const ctx = makeHostCtx()
+    apply(ctx, { dshHome: home })
+
+    /*
+     * ① 会话先以**标准预设**创建 —— 模拟那台 09-27 的历史会话。
+     * `agent/created` 会读会话自报的预设，非 companion-mode 直接 return，
+     * 但 agent scope 已在更早一行存进 agentCtxBySession（这是②能工作的前提）。
+     */
+    const agentCtx = {
+      systemPrompt: { section: () => () => {}, variable: () => () => {} },
+      tools: ctx.tools,
+    }
+    const session = {
+      id: 's-hist',
+      blank: false,
+      append: () => {},
+      snapshotEvents: () => [{ type: 'agent-preset/selected', data: { agentPreset: 'standard-gitbash' } }],
+    }
+    ctx.emit('agent/created', { agent: { session, ctx: agentCtx } }, {})
+    await new Promise((r) => setImmediate(r))
+    assert.deepEqual(ctx.restricted, [], '标准预设会话不该收窄')
+
+    // ② 用户绑定这个伙伴
+    await writeBinding(paths, 's-hist', 'chatty')
+
+    // ③ 界面把预设切成「伙伴模式」——只触发这个事件
+    ctx.emit('agent-preset/selected', 's-hist', 'companion-mode')
+    await new Promise((r) => setImmediate(r))
+
+    assert.equal(ctx.restricted.length, 1, '切到伙伴模式必须装上工具收窄（这正是漏掉的那条路径）')
+    assert.deepEqual(
+      ctx.restricted[0],
+      { allow: ['ask_user_question', 'read', 'web_search'] },
+      '应下发该伙伴的 allow 白名单（展开后排序），write/edit/pwsh 被挡在外面',
+    )
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('预设切换：切走不该装收窄', async () => {
+  const { home, paths } = makeHome()
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const companionDir = join(paths.companionsRoot, 'chatty')
+    mkdirSync(companionDir, { recursive: true })
+    writePresetMeta(companionDir, { name: '聊天', tools: { allow: ['read'] } })
+    await writeBinding(paths, 's1', 'chatty')
+
+    const ctx = makeHostCtx()
+    apply(ctx, { dshHome: home })
+
+    const agentCtx = { systemPrompt: { section: () => () => {}, variable: () => () => {} }, tools: ctx.tools }
+    ctx.emit('agent/created', { agent: { session: { id: 's1', blank: true, append: () => {} }, ctx: agentCtx } }, {})
+    await new Promise((r) => setImmediate(r))
+
+    const before = ctx.restricted.length
+    ctx.emit('agent-preset/selected', 's1', 'standard')
+    await new Promise((r) => setImmediate(r))
+    assert.equal(ctx.restricted.length, before, '切走不该装收窄')
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('伙伴清单配了当前不存在的工具时：不报错、只警告，存在的照常下发', async () => {
+  /*
+   * 用户诉求：allow 里写了某个工具，但那台机器上没装对应插件（如 find_dsh_plugin
+   * 来自 dsh-find-plugin、mcp__dbx__* 来自 MCP）——**不能阻断**，只提示。
+   *
+   * expand() 只把匹配到的名字放进下发名单，其余进 unmatched，因此递给官方
+   * restrict() 的一定是实际存在的名字，不会撞它的"未知工具"校验。
+   */
+  const { home, paths } = makeHome()
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const companionDir = join(paths.companionsRoot, 'chatty')
+    mkdirSync(companionDir, { recursive: true })
+    writePresetMeta(companionDir, {
+      name: '聊天',
+      // 后两个是别的插件提供的，这个"部署"里没有
+      tools: { allow: ['read', 'find_dsh_plugin', 'x_search'] },
+    })
+    await writeBinding(paths, 's1', 'chatty')
+
+    const ctx = makeHostCtx()
+    apply(ctx, { dshHome: home })
+
+    const agentCtx = { systemPrompt: { section: () => () => {}, variable: () => () => {} }, tools: ctx.tools }
+    // 会话说自己跑的就是伙伴模式——否则 agent/created 会在预设判断处 return
+    const session = {
+      id: 's1',
+      blank: true,
+      append: () => {},
+      snapshotEvents: () => [{ type: 'agent-preset/selected', data: { agentPreset: 'companion-mode' } }],
+    }
+    let threw = false
+    try {
+      ctx.emit('agent/created', { agent: { session, ctx: agentCtx } }, {})
+      await new Promise((r) => setImmediate(r))
+    } catch {
+      threw = true
+    }
+
+    assert.equal(threw, false, '配了不存在的工具绝不能抛错')
+    /*
+     * 语义（2026-09-28 起）：精确名**原样下发**，不管本地名单里有没有。
+     *
+     * 因为本地名单（`view()` 全局视图）**不完整** —— 它没有预设层的工具。
+     * 拿它过滤精确名会把 read/write/web_search 这些合法工具误杀
+     * （实测事故：伙伴配 10 项 allow，会话只剩 2 个）。校验交给 restrict 自己，
+     * 它的 `view(agentScope)` 才是正确名单。
+     */
+    assert.deepEqual(
+      ctx.restricted,
+      [{ allow: ['find_dsh_plugin', 'read', 'x_search'] }],
+      '精确名原样下发（本桩的 restrict 不校验名单，所以不存在的名字也照传）',
+    )
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('预设切换：注入【已存在】时收窄仍必须装上（共用守卫的回归）', async () => {
+  /*
+   * ⚠️ 这条才是真实事故现场。
+   *
+   * 上一条测试里，会话在 agent/created 时报的是 standard → 早 return →
+   * **注入没装** → 切预设时 `injections.has` 为 false → 即便共用同一个守卫
+   * 也会放行。所以那条测不出"共用守卫"这个 bug。
+   *
+   * 真实情形是：会话在 agent/created 时**已经绑了伙伴**（恢复历史会话、
+   * 或"先绑伙伴再切预设"的常见次序）→ 注入已装 → `injections.has` 为 true
+   * → 共用守卫把整段跳过 → **收窄永远装不上**。
+   *
+   * 所以这条故意让会话自报 companion-mode（即走装注入那条分支），
+   * 再触发切换事件，断言收窄仍然被调用。
+   */
+  const { home, paths } = makeHome()
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const companionDir = join(paths.companionsRoot, 'chatty')
+    mkdirSync(companionDir, { recursive: true })
+    writePresetMeta(companionDir, { name: '聊天', tools: { allow: ['read'] } })
+    // 会话在创建前就已绑定 —— 这正是注入会在 agent/created 时装上的原因
+    await writeBinding(paths, 's-bound', 'chatty')
+
+    const ctx = makeHostCtx()
+    apply(ctx, { dshHome: home })
+
+    const agentCtx = { systemPrompt: { section: () => () => {}, variable: () => () => {} }, tools: ctx.tools }
+    const session = {
+      id: 's-bound',
+      blank: true,
+      append: () => {},
+      snapshotEvents: () => [{ type: 'agent-preset/selected', data: { agentPreset: 'companion-mode' } }],
+    }
+    // agent/created：会话已是伙伴模式 + 已绑伙伴 ⇒ 注入在这里装上
+    ctx.emit('agent/created', { agent: { session, ctx: agentCtx } }, {})
+    await new Promise((r) => setImmediate(r))
+    const afterCreate = ctx.restricted.length
+
+    // 再切一次预设（用户切走又切回，或界面重放选择）
+    ctx.emit('agent-preset/selected', 's-bound', 'companion-mode')
+    await new Promise((r) => setImmediate(r))
+
+    assert.ok(
+      ctx.restricted.length > afterCreate,
+      '注入已存在时，切预设分支仍必须装收窄——否则"先绑伙伴的会话"永远收窄不了',
+    )
+    assert.deepEqual(ctx.restricted.at(-1), { allow: ['read'] })
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * 「选伙伴」这一路径也要装工具收窄（2026-09-28 第二次事故）
+ *
+ * 真实交互次序（从会话日志还原）：
+ *   17:06:11  新建会话        → agent/created          绑定表【空】→ 跳过
+ *   17:06:13  切到伙伴模式    → agent-preset/selected  绑定仍【空】→ 跳过
+ *   17:06:14  选伙伴          → PUT /companion 写绑定    ← 没有任何事件
+ *   17:06:18  发请求          → 35 个工具，收窄从未执行
+ *
+ * 绑定写入本身不触发事件，所以前两条路径全都抢在绑定之前。
+ * 只有 PUT /companion（用户表达"用这个伙伴"的那一刻）是正确时机。
+ *
+ * 之前的测试全部是"先 writeBinding 再 emit 事件"，次序反了，
+ * 所以一次都没覆盖到这个真实场景。
+ * ------------------------------------------------------------------ */
+
+/** 起一个真 HTTP server + 完整 apply()，返回请求工具。 */
+async function withHostServer(home, injectedCtx) {
+  const { createServer } = await import('node:http')
+  let handler
+  // 传 injectedCtx 时用它（例如带真实 restrict 语义的桩），否则用默认的
+  const ctx = injectedCtx ?? makeHostCtx()
+  // 捕获真实路由 handler（默认实现是空函数）
+  ctx.webServer = { register: (route) => { handler = route.handler; return () => {} } }
+  apply(ctx, { dshHome: home })
+  assert.ok(handler, '应注册路由 handler')
+
+  const server = createServer((req, res) => {
+    handler(req, res).catch(() => { res.writeHead(500); res.end('err') })
+  })
+  await new Promise((r) => server.listen(0, '127.0.0.1', r))
+  const port = server.address().port
+  const call = async (path, options = {}) => {
+    const res = await fetch(`http://127.0.0.1:${port}/companion${path}`, {
+      method: options.method ?? 'GET',
+      headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}`, 'sec-fetch-site': 'same-origin' },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    })
+    const text = await res.text()
+    let json
+    try { json = JSON.parse(text) } catch { json = undefined }
+    return { status: res.status, json, text }
+  }
+  return { ctx, call, close: () => new Promise((r) => server.close(r)) }
+}
+
+test('选伙伴（PUT /companion）时必须装工具收窄——真实交互次序的回归', async () => {
+  const { home, paths } = makeHome()
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  let srv
+  try {
+    const companionDir = join(paths.companionsRoot, 'chatty')
+    mkdirSync(companionDir, { recursive: true })
+    writePresetMeta(companionDir, { name: '聊天', tools: { allow: ['read', 'web_search'] } })
+
+    srv = await withHostServer(home, makeRestrictCtx())
+    const ctx = srv.ctx
+
+    /*
+     * ① 新建会话 —— 此刻**绑定表是空的**（这正是真实次序的关键）。
+     * 会话说自己是 companion-mode（用户在新会话页选了伙伴模式预设）。
+     */
+    const agentCtx = { systemPrompt: { section: () => () => {}, variable: () => () => {} }, tools: ctx.tools }
+    const session = {
+      id: 's-live',
+      blank: true,
+      append: () => {},
+      snapshotEvents: () => [{ type: 'agent-preset/selected', data: { agentPreset: 'companion-mode' } }],
+    }
+    ctx.emit('agent/created', { agent: { session, ctx: agentCtx } }, {})
+    await new Promise((r) => setImmediate(r))
+    assert.equal(ctx.live.length, 0, '前置：此时还没绑定，不该收窄')
+
+    // ② 切预设（真实场景里紧随创建）
+    ctx.emit('agent-preset/selected', 's-live', 'companion-mode')
+    await new Promise((r) => setImmediate(r))
+    assert.equal(ctx.live.length, 0, '前置：绑定仍为空，仍不该收窄')
+
+    // ③ 用户选伙伴 —— 这才是收窄该发生的时刻
+    // 路径要带 /api 段：handler 会先 slice 掉 /companion 前缀，再匹配 /api/companion
+    const res = await srv.call('/api/companion', { method: 'PUT', body: { companion: 'chatty', session: 's-live' } })
+    assert.equal(res.status, 200, `选伙伴应成功，实际 ${res.status} ${res.text}`)
+    await new Promise((r) => setImmediate(r))
+
+    assert.equal(ctx.live.length, 1, '选伙伴必须装工具收窄——否则前两条路径全抢在绑定之前，收窄永远不生效')
+    assert.deepEqual(ctx.visible(), ['read', 'web_search'], '只应剩该伙伴 allow 里的两项')
+  } finally {
+    if (srv) await srv.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * 收窄的**撤销**：换伙伴 / 置空 / 切走（2026-09-28 代码审查发现）
+ *
+ * 官方 restriction 是**只增不减 + 交集**语义
+ * （dsh-tools/lib/index.js:2641-2644 的 admits() 要求每一条都放行）。
+ * 我们之前把 `restrict()` 返回的 disposer 丢掉了，于是：
+ *
+ * - 换伙伴：新旧 allow 取交集 —— 新伙伴多要一个工具也要不到；
+ * - 置空「无伙伴」：旧 allow 继续生效，用户以为放开了、实际仍被限制；
+ * - 切回官方 standard：官方模式本该全套工具，却仍被我们的 allow 挡着。
+ *
+ * 修法：按会话存住 disposer，任何切换**先撤后装**。
+ * ------------------------------------------------------------------ */
+
+/** 假 ctx：restrict 有真实语义（叠加 + 交集），并支持 disposer 撤销。 */
+function makeRestrictCtx() {
+  const listeners = new Map()
+  const logs = { info: [], warn: [] }
+  /** 该会话当前挂着的 restriction 列表（模拟官方 layer 上的只增不减）。 */
+  const live = []
+  const KNOWN = ['read', 'write', 'web_search', 'pwsh']
+  return {
+    live,
+    logs,
+    /** 当前真正可见的工具（交集语义）。 */
+    visible: () => KNOWN.filter((name) => live.every((f) => {
+      if (f.allow !== undefined && !f.allow.has(name)) return false
+      if (f.deny !== undefined && f.deny.has(name)) return false
+      return true
+    })),
+    baseUrl: undefined,
+    on(event, handler) { const l = listeners.get(event) ?? []; l.push(handler); listeners.set(event, l); return () => {} },
+    emit(event, ...args) { for (const h of listeners.get(event) ?? []) h(...args) },
+    get: () => undefined,
+    effect: (fn) => fn(),
+    webServer: { register: () => {} },
+    logger: { info: (m) => logs.info.push(String(m)), warn: (m) => logs.warn.push(String(m)) },
+    tools: {
+      register() {},
+      view: () => ({ restrictableNames: new Set(KNOWN) }),
+      restrict(filter) {
+        const compiled = {
+          ...filter.allow !== undefined ? { allow: new Set(filter.allow) } : {},
+          ...filter.deny !== undefined ? { deny: new Set(filter.deny) } : {},
+        }
+        live.push(compiled)
+        // 官方返回 disposer：撤销这一条
+        return () => {
+          const i = live.indexOf(compiled)
+          if (i >= 0) live.splice(i, 1)
+        }
+      },
+    },
+  }
+}
+
+/** 建一个伙伴目录（写 settings.json）。 */
+function makeCompanion(paths, id, tools) {
+  const dir = join(paths.companionsRoot, id)
+  mkdirSync(dir, { recursive: true })
+  writePresetMeta(dir, { name: id, tools })
+  return dir
+}
+
+test('换伙伴：新的 allow 必须完全替换旧的，不能与旧名单取交集', async () => {
+  const { home, paths } = makeHome()
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  let srv
+  try {
+    makeCompanion(paths, 'narrow', { allow: ['read'] })
+    makeCompanion(paths, 'wide', { allow: ['read', 'write', 'web_search'] })
+
+    srv = await withHostServer(home, makeRestrictCtx())
+    const ctx = srv.ctx
+    const agentCtx = { systemPrompt: { section: () => () => {}, variable: () => () => {} }, tools: ctx.tools }
+    const session = {
+      id: 's-swap', blank: true, append: () => {},
+      snapshotEvents: () => [{ type: 'agent-preset/selected', data: { agentPreset: 'companion-mode' } }],
+    }
+    ctx.emit('agent/created', { agent: { session, ctx: agentCtx } }, {})
+    await new Promise((r) => setImmediate(r))
+
+    // 选窄伙伴
+    let res = await srv.call('/api/companion', { method: 'PUT', body: { companion: 'narrow', session: 's-swap' } })
+    assert.equal(res.status, 200)
+    await new Promise((r) => setImmediate(r))
+    assert.deepEqual(ctx.visible(), ['read'], '窄伙伴应只剩 read')
+
+    // 换成宽伙伴 —— 这一步若与旧名单取交集，write/web_search 永远拿不到
+    res = await srv.call('/api/companion', { method: 'PUT', body: { companion: 'wide', session: 's-swap' } })
+    assert.equal(res.status, 200)
+    await new Promise((r) => setImmediate(r))
+
+    assert.deepEqual(
+      ctx.visible(), ['read', 'write', 'web_search'],
+      '换伙伴必须整体替换：交集语义下不撤旧的，新伙伴多要的工具会永远拿不到',
+    )
+    assert.equal(ctx.live.length, 1, '旧 restriction 必须被撤掉，不能叠加')
+  } finally {
+    if (srv) await srv.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('置空「无伙伴」：必须撤掉旧的收窄，工具恢复全可见', async () => {
+  const { home, paths } = makeHome()
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  let srv
+  try {
+    makeCompanion(paths, 'narrow', { allow: ['read'] })
+
+    srv = await withHostServer(home, makeRestrictCtx())
+    const ctx = srv.ctx
+    const agentCtx = { systemPrompt: { section: () => () => {}, variable: () => () => {} }, tools: ctx.tools }
+    const session = {
+      id: 's-clear', blank: true, append: () => {},
+      snapshotEvents: () => [{ type: 'agent-preset/selected', data: { agentPreset: 'companion-mode' } }],
+    }
+    ctx.emit('agent/created', { agent: { session, ctx: agentCtx } }, {})
+    await new Promise((r) => setImmediate(r))
+
+    let res = await srv.call('/api/companion', { method: 'PUT', body: { companion: 'narrow', session: 's-clear' } })
+    assert.equal(res.status, 200)
+    await new Promise((r) => setImmediate(r))
+    assert.deepEqual(ctx.visible(), ['read'], '前置：已收窄')
+
+    // 置空
+    res = await srv.call('/api/companion', { method: 'PUT', body: { companion: null, session: 's-clear' } })
+    assert.equal(res.status, 200, `置空应成功，实际 ${res.status} ${res.text}`)
+    await new Promise((r) => setImmediate(r))
+
+    assert.deepEqual(
+      ctx.visible(), ['read', 'write', 'web_search', 'pwsh'],
+      '置空「无伙伴」后工具应恢复全可见——不撤旧的，用户以为放开了实际仍被限制',
+    )
+  } finally {
+    if (srv) await srv.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('切回官方模式：必须撤掉收窄，官方模式不该被我们的 allow 限制', async () => {
+  const { home, paths } = makeHome()
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  let srv
+  try {
+    makeCompanion(paths, 'narrow', { allow: ['read'] })
+
+    srv = await withHostServer(home, makeRestrictCtx())
+    const ctx = srv.ctx
+    const agentCtx = { systemPrompt: { section: () => () => {}, variable: () => () => {} }, tools: ctx.tools }
+    const session = {
+      id: 's-back', blank: true, append: () => {},
+      snapshotEvents: () => [{ type: 'agent-preset/selected', data: { agentPreset: 'companion-mode' } }],
+    }
+    ctx.emit('agent/created', { agent: { session, ctx: agentCtx } }, {})
+    await new Promise((r) => setImmediate(r))
+    await srv.call('/api/companion', { method: 'PUT', body: { companion: 'narrow', session: 's-back' } })
+    await new Promise((r) => setImmediate(r))
+    assert.deepEqual(ctx.visible(), ['read'], '前置：伙伴模式已收窄')
+
+    // 用户把预设切回官方 standard
+    ctx.emit('agent-preset/selected', 's-back', 'standard-gitbash')
+    await new Promise((r) => setImmediate(r))
+
+    assert.deepEqual(
+      ctx.visible(), ['read', 'write', 'web_search', 'pwsh'],
+      '切回官方模式后工具必须恢复全可见——restriction 挂在 agent scope 上，不撤会跟着会话一直生效',
+    )
+  } finally {
+    if (srv) await srv.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
 })

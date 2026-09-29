@@ -50,7 +50,13 @@ if (existsSync(companionsDir)) {
   }
 }
 
-// 3. 每个伙伴的 preset.yml 里 id 同步改（官方 dsh-agent-presets 读它）
+/*
+ * 3. 老目录里 preset.yml 的 id 同步改。
+ *
+ * 这是**一次性历史脚本**（改名当时用的）。伙伴元数据后来从 preset.yml 换成了
+ * settings.json，而新格式里**根本没有 id 字段**（id 就是目录名），所以这里
+ * 只在老文件还在时做尽力的字符串替换；新目录直接跳过。
+ */
 if (existsSync(companionsDir)) {
   for (const [oldId, newId] of idMap) {
     const meta = join(companionsDir, newId, 'preset.yml')

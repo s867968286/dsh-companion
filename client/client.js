@@ -918,9 +918,30 @@ window.__ModuleLoader__.load({
      *   `SessionSnapshot.awaitingFirstTurn` 的语义
      */
 
-    /** 会话是否还处于"可改绑定"的窗口。 */
+    /**
+     * 会话是否还处于"可改绑定"的窗口。
+     *
+     * ## 三态，不是两态
+     *
+     * 这里必须区分**三种**情况，而不是"可选 / 锁定"两种：
+     *
+     *   1. **未就绪**：快照还没装载，`blank` / `promptAttempted` 都没有权威值
+     *   2. **可选**：会话还没开始（`blank !== false` 且首轮未提交）
+     *   3. **锁定**：已经开始，绑定不可改
+     *
+     * 早先的写法（`if (!session) return false` + 两个字段判断）把第 1 种
+     * 并进了第 2 种 —— `{}` 会穿过两个 `=== ` 判断落到 `return true`。
+     * 后果：会话快照存在但字段尚未装上时，输入栏渲染出**可交互**的下拉，
+     * 而此刻会话可能其实已经开始，用户改完会被服务端以 409 拒绝
+     * （W8 那条红色错误提示的触发路径之一）。
+     *
+     * 未就绪按**锁定**处理：宁可短暂只读，也不放行一个可能无效的写入。
+     * 与 README「锁定态只读」的取舍一致 —— 错误的代价小得多。
+     */
     function canPickCompanion(session) {
       if (!session) return false
+      // 未就绪：关键字段一个都没装上 → 不是"可选"，是"还不知道"
+      if (session.blank === undefined && session.promptAttempted === undefined) return false
       // 还没开始：可选。已经跑起来（首轮已提交）：锁定。
       if (session.blank === false) return false
       if (session.promptAttempted === true) return false
@@ -967,7 +988,23 @@ window.__ModuleLoader__.load({
        */
       const sessionId = props.sessionId
       const useSession = props.useSession ?? noSession
-      const session = useSession((snapshot) => snapshot)
+      /*
+       * ⚠️ 只订阅用得到的两个字段，**不要** `useSession((snapshot) => snapshot)`。
+       *
+       * 这个控件挂在输入栏，而会话快照在流式输出期间每来一个 token 就更新。
+       * 传整个快照 = 返回值每次都是新对象 = 每次 token 都让本控件重渲染一轮，
+       * 白白跟着流式输出跑。
+       *
+       * 我们真正读的只有 `blank` 与 `promptAttempted`（见 canPickCompanion），
+       * 两者都是布尔，值不变时引用不变，宿主就不会重渲染。
+       * 官方各 UI 包一律这么写（trajectory 选 loadingOlder/hasMore、
+       * schedule 选 openState —— dsh-client-ui-trajectory/lib/client.js:8365-8367）。
+       */
+      const session = useSession((snapshot) => (
+        snapshot === undefined || snapshot === null
+          ? undefined
+          : { blank: snapshot.blank, promptAttempted: snapshot.promptAttempted }
+      ))
       const presetId = useSessionPreset(props)
       const [state, setState] = React.useState({ phase: 'loading', list: [], current: null, open: false, error: '' })
       const locked = !canPickCompanion(session)
@@ -1006,7 +1043,22 @@ window.__ModuleLoader__.load({
           .catch(() => {
             if (alive) setState((prev) => ({ ...prev, phase: 'error' }))
           })
-        return () => { alive = false }
+        return () => {
+          alive = false
+          /*
+           * 卸载时必须收回失败提示的计时器。
+           *
+           * 这个计时器此前只在下一次 pick 时被清（见 pick 里的守卫），
+           * effect 没有清理函数 —— 下拉随会话切换被卸载后，5 秒计时器仍会
+           * 触发 setState 打在已卸载组件上。真实 React 里是警告 + 状态竞态，
+           * 并发模式下更明显。参照 omdsh-chatmode 的约定：每个 effect
+           * 都要有配套的清理，卸载后不留任何东西。
+           */
+          if (pickErrorTimer.current) {
+            clearTimeout(pickErrorTimer.current)
+            pickErrorTimer.current = null
+          }
+        }
         /*
          * ⚠️ 依赖必须含 presetId。
          *

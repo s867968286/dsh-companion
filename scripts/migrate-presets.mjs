@@ -40,8 +40,23 @@ console.log('')
 
 for (const id of legacy) {
   const dir = join(paths.legacyPresetsRoot, id)
-  const metaFile = join(dir, 'preset.yml')
-  const meta = existsSync(metaFile) ? readFileSync(metaFile, 'utf8').trim().split('\n')[0] : '(无 preset.yml)'
+  /*
+   * 两种元数据格式都认：老目录是 preset.yml（取 YAML 首行），新目录是
+   * settings.json（取 name 字段）。本脚本是**一次性历史工具**，迁移对象
+   * 可能来自任一时点，所以不假设格式。
+   */
+  const jsonFile = join(dir, 'settings.json')
+  const ymlFile = join(dir, 'preset.yml')
+  let meta = '(无元数据)'
+  if (existsSync(jsonFile)) {
+    try {
+      meta = `name: ${JSON.parse(readFileSync(jsonFile, 'utf8')).name ?? '?'}`
+    } catch {
+      meta = '(settings.json 解析失败)'
+    }
+  } else if (existsSync(ymlFile)) {
+    meta = readFileSync(ymlFile, 'utf8').trim().split('\n')[0]
+  }
   const mdCount = readdirSync(dir).filter((name) => name.endsWith('.md')).length
   const journalDir = join(dir, 'memory')
   const journalCount = existsSync(journalDir) ? readdirSync(journalDir).length : 0

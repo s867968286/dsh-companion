@@ -17,15 +17,22 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 import {
   PLUGIN_NAME,
-  applyToolRestriction,
   measureContext,
-  normalizeConfig,
   resolvePresetDir,
   sessionEvents,
   sessionKeyOf,
 } from './core.js'
 import { COMPANION_EVENT, COMPANION_PROJECTION_KEY, companionFromEvents, normalizeCompanion } from './companion.mjs'
 import { readBindings, readSettings, resolvePaths } from './settings.mjs'
+/*
+ * 伙伴自己的元数据（住在伙伴目录的 settings.json）。
+ *
+ * 这里 import index.js **不成环**：index.js 不 import preset.js——它是独立的
+ * preset 行插件，由预设声明挂载。成环的只有反方向。
+ * 把 readPresetMeta 放在 index.js 而不是下沉到更低层，是因为它已是 host 半
+ * 对外的一等 API（路由与模板都在用），搬动的收益不抵风险。
+ */
+import { readPresetMeta } from './index.js'
 import { createSearchTool } from './search.mjs'
 import { createJournalTool, createMemoryTool } from './tools.mjs'
 import { isHumanMessage, runReview } from './review.mjs'
@@ -244,12 +251,18 @@ function companionDirOf(context, paths) {
 }
 
 /**
- * 装配：提示词 → 工具收窄 → 检索工具 → 自动记忆。
+ * 装配：检索工具 → 记忆工具 → 自动记忆。
+ *
+ * 提示词注入与工具收窄**都不在这里**——两者都按会话绑定的伙伴生效，
+ * 必须住在 agent scope（host 半的 `agent/created`）：
+ * - 提示词：`companion.mjs` 的 `injectCompanionPrompt`
+ * - 工具收窄：`companion.mjs` 的 `restrictCompanionTools`
+ *
+ * 本文件是 preset 行插件，ctx 的 scope 由预设决定，同一预设下多个会话共享。
+ *
  * @param {object} ctx - dsh 上下文。
- * @param {unknown} rawConfig - preset 行的 config（目前只认 tools）。
  */
-export function apply(ctx, rawConfig) {
-  const config = normalizeConfig(rawConfig)
+export function apply(ctx) {
   const paths = resolvePaths()
   // dsh 无控制台启动时 stdout 看不到，所有日志同时落盘（见 createLogger）
   const logger = createLogger(ctx, paths)
@@ -293,27 +306,27 @@ export function apply(ctx, rawConfig) {
    * （官方 `dsh-system-prompt/lib/index.js:345` 只看 `complete === true`）。
    */
 
-  /* 工具收窄：把模式展开成精确名单后交给 tools.restrict */
-  if (config.tools.allow.length > 0 || config.tools.deny.length > 0) {
-    const result = applyToolRestriction(ctx, config.tools)
-    if (result.applied) {
-      const bits = []
-      if (result.filter?.allow?.length) bits.push(`allow=${result.filter.allow.join(',')}`)
-      if (result.filter?.deny?.length) bits.push(`deny=${result.filter.deny.join(',')}`)
-      logger.info?.(`[companion] 工具收窄已生效：${bits.join(' ')}`)
-    } else if (result.reason) {
-      /*
-       * 把真实异常一并打出来：早先只写一句固定文案，升级到 dsh 0.1.5-rc.2 后这条 warn
-       * 连刷十几次都看不出根因，只能靠读 dsh 源码猜。真实原因（读 `ctx.agent` 撞隔离
-       * 边界）就是这样逼出来的，之后不要再把异常吞成散文。
-       */
-      const detail = result.error ? ` | 错误=${result.error}` : ''
-      logger.warn?.(`[companion] 工具收窄未生效：${result.reason}${detail}`)
-    }
-    if (result.unmatched?.length) {
-      logger.warn?.(`[companion] 以下工具模式未匹配到任何可见工具：${result.unmatched.join(', ')}`)
-    }
-  }
+  /*
+   * **工具收窄也不在这里**（2026-09-28 搬走）。
+   *
+   * 早先这段读 `config.tools`（由 `agent.cordis.yml` 模板的一行声明传入）并调
+   * `applyToolRestriction`。rc2 改造成「所有伙伴共用一个声明式预设」之后，
+   * 那一行不再挂载，`config.tools` 恒为空 —— 收窄**静默失效**
+   * （模板里的 `deny: ['mnemon*']` 不再生效），而因为代码还在，看代码看不出问题。
+   *
+   * 现在它由 host 半在**每个会话自己的 agent scope** 里按伙伴注册
+   * （见 companion.mjs 的 `restrictCompanionTools`，调用点在 index.js 的
+   * `agent/created`）。两条理由：
+   *
+   * ① **官方要求**：`tools.restrict()` 必须有 agent scope
+   *    （`dsh-tools/lib/index.js:2897`——"a context-global restriction would
+   *    mask every agent"）；本文件的 ctx 是 preset scope，做不到；
+   * ② **语义需要**：收窄该按**伙伴**而不是按预设，而 preset scope 下同一预设的
+   *    所有会话共享，表达不了"这是哪个伙伴"。
+   *
+   * 数据源也一并改了：不再是预设行的 config，而是**当前伙伴自己的
+   * `companion/companions/<id>/settings.json`** 里的 tools 字段。
+   */
 
   /*
    * 装配信息合并成一条：早先每样打一行（目录 / 参数 / section / 六个文件各一行），
@@ -418,6 +431,43 @@ function shortKey(key) {
 function registerAutoMemory(ctx, resolveCompanionDir, getSettings, logger) {
   /** sessionKey -> { turns, markChars, lastAt, running, runningSince, pending, lastNoticeAt, attempts } */
   const states = new Map()
+
+  /**
+   * 本会话是否要自动记忆：**全局开关 AND 伙伴自己的覆盖**。
+   *
+   * ## 为什么要伙伴级覆盖
+   *
+   * 全局 `autoMemory` 是**插件级**开关，管所有伙伴。但自动记忆对**纯聊天型**
+   * 伙伴是负担：它会在会话结束/轮数到点时跑一次 LLM 回顾并往 `memory/` 写日记，
+   * 而一个只做问答的伙伴根本不需要这些，还会平白多烧 token。
+   *
+   * 而设置页不该为此长出按伙伴的开关——那会让"一个聊天伙伴"这种一次性需求
+   * 把界面撑复杂。所以：**界面管全局，伙伴目录的 `settings.json` 管覆盖**，
+   * 想要例外的那个伙伴手工写一行即可：
+   *
+   * ```json
+   * { "name": "无限", "autoMemory": false }
+   * ```
+   *
+   * ## 语义
+   *
+   * - 伙伴配了 `autoMemory` → **以它为准**（可以 true 覆盖全局的 false，
+   *   也可以 false 覆盖全局的 true）；
+   * - 没配 / 读不到伙伴目录 → 跟随全局。
+   *
+   * 读盘是必然的：`getSettings()` 每次触发都要读全局设置，这里多读一个
+   * 伙伴目录的小 JSON。与"实时生效"的既定取舍一致——改完不必重开会话。
+   *
+   * @param {object} agent - 会话的 agent（用来定位它绑的是哪个伙伴）。
+   * @returns {boolean} 本次是否允许自动记忆。
+   */
+  const autoMemoryOn = (agent) => {
+    const global = getSettings().autoMemory === true
+    const dir = resolveCompanionDir(agent)
+    if (!dir) return global
+    const override = readPresetMeta(dir).autoMemory
+    return override === undefined ? global : override
+  }
 
   /**
    * sessionKey -> agent。
@@ -656,7 +706,7 @@ function registerAutoMemory(ctx, resolveCompanionDir, getSettings, logger) {
     const key = sessionKeyOf(agent)
     if (!key) return
     const settings = getSettings()
-    if (settings.autoMemory !== true) return
+    if (!autoMemoryOn(agent)) return
     const state = stateOf(key)
     state.turns += 1
     const total = transcriptCharsOf(agent)
@@ -670,7 +720,7 @@ function registerAutoMemory(ctx, resolveCompanionDir, getSettings, logger) {
     const key = sessionKeyOf(agent)
     if (!key) return
     // 会话结束必触发：force 绕过防抖。开关关闭时同样不写。
-    if (getSettings().autoMemory === true) schedule(agent, key, '会话结束', true)
+    if (autoMemoryOn(agent)) schedule(agent, key, '会话结束', true)
     // 会话结束：状态表按会话键存放，一并清掉避免 Map 增长
     agentsBySession.delete(key)
     // 留足时间给可能正在跑的回顾（含补跑），之后才清状态
@@ -694,11 +744,11 @@ function registerAutoMemory(ctx, resolveCompanionDir, getSettings, logger) {
 
   ctx.on('session/event', (session, event) => {
     if (event?.type !== 'compaction/start') return
-    if (getSettings().autoMemory !== true) return
     const key = sessionKeyOf({ session })
     if (!key) return
     const agent = agentsBySession.get(key)
     if (!agent) return
+    if (!autoMemoryOn(agent)) return
     /*
      * force：压缩是「最后机会」，不能被 5 秒防抖吞掉。
      * 若此时正好有回顾在跑，schedule 会记 pending 并在其结束后补跑。

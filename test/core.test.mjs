@@ -623,12 +623,32 @@ test('applyToolRestriction：allow 与 deny 同时给；全不命中不下发；
   assert.deepEqual(calls, [{ allow: ['read_page'], deny: ['mnemon_recall'] }])
   assert.deepEqual(result.unmatched, [])
 
-  assert.equal(applyToolRestriction(ctx, { allow: ['nope'], deny: [] }).applied, false)
-  assert.equal(calls.length, 1)
+  /*
+   * ⚠️ 语义在 2026-09-28 变了：**精确名不再拿本地名单过滤，原样交给 restrict 校验**。
+   *
+   * 原因：`view()` 只给全局层工具，而 agent 可见的还有一大块来自预设层。
+   * 用全局名单过滤精确名，会把预设层的合法工具（read/write/web_search…）
+   * 当成"未匹配"丢掉 —— 实测事故：伙伴配 10 项 allow，会话只剩 2 个工具。
+   *
+   * 现在 `nope` 这样不存在的名字【会下发】，由 restrict 用它自己的（正确的）
+   * scoped 名单去拒绝；我们只把它的报错降级成 warn，不让会话起不来。
+   */
+  const unknownName = applyToolRestriction(ctx, { allow: ['nope'], deny: [] })
+  assert.equal(unknownName.applied, true, '精确名原样下发（含不存在的，交由官方校验）')
+  assert.deepEqual(calls.at(-1), { allow: ['nope'] })
 
-  const empty = applyToolRestriction({ tools: { schemas: () => [], restrict: () => {} } }, { allow: [], deny: ['a'] })
+  // 名单读不到 + 只有精确名 → 仍应下发（名单只对通配是必需的）
+  const noList = applyToolRestriction({ tools: { restrict: () => {} } }, { allow: ['read'], deny: [] })
+  assert.equal(noList.applied, true, '纯精确名不依赖本地名单')
+
+  // 名单读不到 + 有通配 → 无法展开，不下发
+  const wildcardNoList = applyToolRestriction({ tools: { restrict: () => {} } }, { allow: [], deny: ['a*'] })
+  assert.equal(wildcardNoList.applied, false, '通配必须有名单才能展开')
+  assert.match(wildcardNoList.reason, /通配/)
+
+  const empty = applyToolRestriction({ tools: { schemas: () => [], restrict: () => {} } }, { allow: [], deny: ['a*'] })
   assert.equal(empty.applied, false)
-  assert.match(empty.reason, /没有可见工具/)
+  assert.match(empty.reason, /通配/)
 })
 
 test('applyToolRestriction：restrict 抛错与 ctx.tools 缺失都降级', () => {
@@ -722,4 +742,113 @@ test('applyToolRestriction：两条路径都抛错时报告真实原因', () => 
    */
   assert.match(result.error, /view boom/)
   assert.match(result.error, /schemas boom/)
+})
+
+test('applyToolRestriction：精确名不得被本地名单过滤（事故回归——曾把预设层工具全挡掉）', () => {
+  /*
+   * 实测事故（2026-09-28）：伙伴配了 10 项 allow
+   *   ['read','read_image','write','edit','web_search','web_fetch',
+   *    'ask_user_question','present','read_page','x_search']
+   * 结果会话只剩 **2 个**工具：read_page、x_search。
+   *
+   * 根因：`view()` 不传 scope 只给**全局层**工具，而
+   * read/write/web_search 等 8 项来自**预设层**（companion-mode 的
+   * tool-fs / tool-web 等行注册的）。旧 expand() 拿全局名单过滤精确名，
+   * 那 8 项匹配不到 → 当 unmatched 丢掉 → 下发 allow=['read_page','x_search']
+   * → 白名单把预设层工具全部挡掉。
+   *
+   * 修法：精确名原样交给 restrict（它用 view(agentScope) 这份正确名单校验）。
+   * 这条测试锁的就是"不许再用本地名单过滤精确名"。
+   */
+  const calls = []
+  // 模拟"全局视图只看得见插件工具"——预设层工具不在其中
+  const ctx = {
+    tools: {
+      view: () => ({ restrictableNames: new Set(['read_page', 'x_search', 'find_dsh_plugin']) }),
+      schemas: () => [{ name: 'read_page' }, { name: 'x_search' }],
+      restrict: (filter) => calls.push(filter),
+    },
+  }
+  const cfg = ['read', 'read_image', 'write', 'edit', 'web_search', 'web_fetch',
+    'ask_user_question', 'present', 'read_page', 'x_search']
+  const result = applyToolRestriction(ctx, { allow: cfg, deny: [] })
+
+  assert.equal(result.applied, true)
+  assert.deepEqual(
+    calls[0].allow,
+    [...cfg].sort(),
+    '10 项必须原样下发——被本地名单过滤掉 8 项就是那个"只剩 2 个工具"的事故',
+  )
+  assert.equal(calls[0].allow.length, 10, '不许少')
+  assert.deepEqual(result.unmatched, [], '精确名不产生 unmatched')
+})
+
+test('未知名要逐个剔除，不让整条收窄失效（事故回归——曾导致全套 34 个工具放行）', () => {
+  /*
+   * 实测事故（2026-09-28）：伙伴的 allow 里有一项 `x_search`，而该部署把它
+   * 关掉了（modsearch 的 xSearch:false 让这个工具不再注册）。
+   *
+   * `restrict()` 遇到未知名会**整条抛错** → applied=false →
+   * **其余 6 项一起失效**，会话拿到全套 34 个工具。用户看到"工具拦截又坏了"。
+   *
+   * 而那份正确的 scoped 名单本地读不到（view() 只给全局层），无法预先过滤；
+   * 好在官方报错里带了它，所以解析出未知名、剔除后重试。
+   *
+   * 这条锁住：**一个写错的名字不该让整条规则失效**。
+   */
+  const KNOWN = new Set(['read', 'read_image', 'web_search', 'web_fetch', 'ask_user_question', 'read_page'])
+  const attempts = []
+  const ctx = {
+    tools: {
+      // 全局视图不完整（真实情况：只有插件提供的工具）
+      view: () => ({ restrictableNames: new Set(['read_page']) }),
+      restrict(filter) {
+        attempts.push(JSON.parse(JSON.stringify(filter)))
+        const names = [...(filter.allow ?? []), ...(filter.deny ?? [])]
+        const unknown = names.filter((n) => !KNOWN.has(n))
+        if (unknown.length > 0) {
+          throw new Error(
+            `tools.restrict() names unknown global tool${unknown.length > 1 ? 's' : ''} ` +
+            `${unknown.map((n) => `"${n}"`).join(', ')}; known global tools: ${[...KNOWN].sort().join(', ')}`,
+          )
+        }
+        return () => {}
+      },
+    },
+  }
+
+  // 无限 的真实配置：x_search 已不存在
+  const cfg = ['read', 'read_image', 'web_search', 'web_fetch', 'ask_user_question', 'read_page', 'x_search']
+  const result = applyToolRestriction(ctx, { allow: cfg, deny: [] })
+
+  assert.equal(result.applied, true, '一个不存在的名字不该让整条收窄失效')
+  assert.deepEqual(
+    result.filter.allow,
+    ['ask_user_question', 'read', 'read_image', 'read_page', 'web_fetch', 'web_search'],
+    '其余 6 项必须保住（x_search 被剔除）',
+  )
+  assert.deepEqual(result.dropped, ['x_search'], '被剔除的名字要报出来，便于用户发现配置过期')
+  assert.equal(attempts.length, 2, '第一次失败、剔除后重试一次')
+})
+
+test('未知名全部不存在时：不下发，且说明原因', () => {
+  const ctx = {
+    tools: {
+      view: () => ({ restrictableNames: new Set() }),
+      restrict(filter) {
+        // 忠实复刻官方报错：把【真实的未知名】逐个列出来
+        const names = [...(filter.allow ?? []), ...(filter.deny ?? [])]
+        if (names.length > 0) {
+          throw new Error(
+            `tools.restrict() names unknown global tool${names.length > 1 ? 's' : ''} ` +
+            `${names.map((n) => `"${n}"`).join(', ')}; known global tools: a, b`,
+          )
+        }
+        return () => {}
+      },
+    },
+  }
+  const result = applyToolRestriction(ctx, { allow: ['不存在甲', '不存在乙'], deny: [] })
+  assert.equal(result.applied, false, '全都不存在时不该下发（空 allow 会屏蔽全部工具）')
+  assert.match(result.reason, /不存在/)
 })

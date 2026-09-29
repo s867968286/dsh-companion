@@ -587,25 +587,59 @@ export function applyToolRestriction(ctx, tools) {
     }
   }
 
-  if (known.length === 0) {
+  /*
+   * 名单为空**只在真的需要它时才致命** —— 也就是配置里出现了通配。
+   *
+   * 精确名不需要名单（原样交给 `restrict()` 校验），所以"读不到名单"不该
+   * 拦下它们。早先这里无条件 return，会把纯精确名配置一并拒掉 ——
+   * 而那恰好是最常见、也最正确的一种写法。
+   */
+  const wantsWildcard = [...tools.allow, ...tools.deny].some((p) => p.includes('*'))
+  if (known.length === 0 && wantsWildcard) {
     /*
      * 名单为空有两种成因，报错必须分开：真读不到（异常）才叫失败；读到了但一条
-     * 都没有，说明装配期本来就没有全局工具，收窄无从下手——那不是故障。
+     * 都没有，说明装配期本来就没有全局工具，通配无从展开——那不是故障。
      */
     if (errors.length === 0) {
-      return { applied: false, reason: '当前没有可见工具，模式无需展开' }
+      return { applied: false, reason: '当前没有可见工具，通配模式无需展开' }
     }
     return {
       applied: false,
-      reason: '读取可见工具名单失败，无法展开模式',
+      reason: '读取可见工具名单失败，通配模式无法展开',
       error: errors.join(' | '),
     }
   }
 
+  /*
+   * 展开一个模式列表。**精确名直接放行，只有通配才查名单。**
+   *
+   * ## 为什么必须这样（2026-09-28 实测事故）
+   *
+   * `view()` **不传 scope 时只给全局层的工具**，而 agent 实际可见的工具里
+   * 还有一大块来自**预设层**（`tool-fs` / `tool-web` 等行注册的 read/write/
+   * web_search…）。两边名单不一致，于是：
+   *
+   *   伙伴配 allow=['read','write',...,'read_page','x_search']（10 项）
+   *   → 'read'/'write'/… 8 项在全局名单里【匹配不到】
+   *   → 被当成 unmatched 丢弃，只留下恰好在全局层的 read_page / x_search
+   *   → 下发 allow=['read_page','x_search']
+   *   → **预设层的 8 个工具全被挡掉，会话只剩 2 个工具**
+   *
+   * 而 `restrict()` 自己校验时用的是 `view(agentScope)` —— **那份名单是对的**
+   * （含预设层）。所以正确做法是：**精确名原样交给它校验**，我们不预读、不过滤。
+   *
+   * 通配（`mnemon*` 这类）仍需要名单来展开，只能退回全局视图那份；
+   * 但那时语义是保守的（展开不到就不下发），不会造成"全部被挡"。
+   */
   const expand = (patterns) => {
     const names = new Set()
     const unmatched = []
     for (const pattern of patterns) {
+      // 无通配 = 精确名：原样放行，交给 restrict 用它自己的（正确的）名单校验
+      if (!pattern.includes('*')) {
+        names.add(pattern)
+        continue
+      }
       let hit = false
       for (const name of known) {
         if (matchToolName(pattern, name)) {
@@ -630,14 +664,89 @@ export function applyToolRestriction(ctx, tools) {
     return { applied: false, reason: '模式没有匹配到任何可见工具', unmatched }
   }
 
-  try {
-    registry.restrict(filter)
-    return { applied: true, filter, unmatched }
-  } catch (error) {
-    return {
-      applied: false,
-      reason: error instanceof Error ? error.message : String(error),
-      unmatched,
+  /*
+   * ## 未知名要逐个剔除，不能让整条下发失败
+   *
+   * 实测事故（2026-09-28）：伙伴的 allow 里有一项 `x_search`，而该部署把它
+   * 关掉了。`restrict()` 遇到未知名会**整条抛错**，于是 `applied=false` ——
+   * **其余所有项（read / web_search …）一起失效**，会话拿到全套 34 个工具。
+   * 用户看到的现象是"工具拦截又坏了"。
+   *
+   * 而且那份"正确的 scoped 名单"（含预设层）我们本地读不到：`view()` 不传
+   * scope 只给全局层。所以无法预先过滤。
+   *
+   * 好在官方报错里**带了那份名单**：
+   *   `names unknown global tool "x"; known global tools: a, b, c`
+   * 于是可以解析出未知项、剔除后重试 —— 剩下的照常生效。
+   * 配置写错一个名字，不该让整条规则失效。
+   *
+   * ## 撤销入口
+   *
+   * restriction 是**只增不减 + 交集**语义（`dsh-tools/lib/index.js:2641-2644`
+   * 的 `admits()` 要求每一条都放行）。同一会话换伙伴时再调一次 restrict 会与
+   * 旧的那条**取交集**：旧 allow=[read]、新 allow=[read,write] → 交集仍是
+   * [read]，新的 write 拿不到。撤销入口只有 `restrict()` 的返回值。
+   */
+  const attempt = (candidate) => {
+    try {
+      const dispose = registry.restrict(candidate)
+      return { ok: true, dispose }
+    } catch (error) {
+      return { ok: false, error }
     }
   }
+
+  /** 从官方报错里解析未知名。报错格式固定，见上面的注释。 */
+  const unknownFrom = (error) => {
+    const text = error instanceof Error ? error.message : String(error)
+    if (!/names unknown global tool/.test(text)) return []
+    const segment = text.slice(0, text.indexOf('; known global tools:'))
+    return [...segment.matchAll(/"([^"]+)"/g)].map((match) => match[1])
+  }
+
+  let candidate = filter
+  let first = attempt(candidate)
+  const dropped = []
+  /*
+   * 最多两轮：第一轮剔除全部未知名。第二轮是兜底 —— 万一官方的报错格式
+   * 只列了部分名字，还能再收敛一次。之后放弃，避免异常情况下死循环。
+   */
+  for (let round = 0; !first.ok && round < 2; round += 1) {
+    const unknown = unknownFrom(first.error)
+    if (unknown.length === 0) break
+    const drop = new Set(unknown)
+    const next = {}
+    for (const key of ['allow', 'deny']) {
+      if (candidate[key] === undefined) continue
+      const kept = candidate[key].filter((name) => !drop.has(name))
+      // 剔除后为空就不再带这个键（空 allow 会屏蔽掉全部工具，属于误伤）
+      if (kept.length > 0) next[key] = kept
+    }
+    if (next.allow === undefined && next.deny === undefined) {
+      return {
+        applied: false,
+        reason: `配置里的工具名在当前部署都不存在（已剔除：${unknown.join(', ')}）`,
+        unmatched: [...unmatched, ...unknown],
+      }
+    }
+    candidate = next
+    dropped.push(...unknown)
+    first = attempt(candidate)
+  }
+
+  if (first.ok) {
+    return {
+      applied: true,
+      filter: candidate,
+      unmatched: [...unmatched, ...dropped],
+      dropped,
+      dispose: typeof first.dispose === 'function' ? first.dispose : undefined,
+    }
+  }
+  return {
+    applied: false,
+    reason: first.error instanceof Error ? first.error.message : String(first.error),
+    unmatched,
+  }
 }
+

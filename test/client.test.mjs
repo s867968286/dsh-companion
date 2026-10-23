@@ -30,7 +30,28 @@ const React = {
  * 在一个隔离的全局环境里执行 client bundle，并返回注册结果。
  * `extraModules` 用于模拟前端模块系统提供的 seed 表（react 等）。
  */
+/**
+ * 官方 primitives 的桩。设置页的开关已改用官方 `Switch`（自绘那份的圆角与
+ * 「通用设置」对不上），模块系统里必须能解析到它，否则 factory 会抛错。
+ */
+const PRIMITIVES_STUB = {
+  Switch: function Switch(props) {
+    return { type: 'Switch', props: props ?? {}, children: [] }
+  },
+}
+
+/**
+ * factory 的 require 桩：react + 官方 primitives。所有调用点共用这一份，
+ * 免得每处各写一遍、新增依赖时漏改某一处（漏改的表现是「某个测试莫名抛错」）。
+ */
+function factoryRequire(specifier) {
+  if (specifier === 'react') return React
+  if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return PRIMITIVES_STUB
+  throw new Error(`client-modules: cannot resolve external "${specifier}"`)
+}
+
 function load(extraModules = {}) {
+  const modules = { '@deepseek-ai/dsh-client-ui-primitives': PRIMITIVES_STUB, ...extraModules }
   let registration = null
   const injected = []
   const document = {
@@ -41,7 +62,7 @@ function load(extraModules = {}) {
   const window = { __ModuleLoader__: { load: (reg) => { registration = reg } } }
   const requireStub = (specifier) => {
     if (specifier === 'react') return React
-    if (specifier in extraModules) return extraModules[specifier]
+    if (specifier in modules) return modules[specifier]
     // 模块系统的真实行为：未知 specifier 抛错（这正是原 BUG 的触发点）。
     throw new Error(`client-modules: cannot resolve external "${specifier}"`)
   }
@@ -61,8 +82,15 @@ function introspect() {
   let registration = null
   const window = { __ModuleLoader__: { load: (reg) => { registration = reg } } }
   const document = { querySelector: () => null, createElement: () => ({ setAttribute() {}, textContent: '' }), head: { appendChild() {} } }
-  new Function('require', 'window', 'document', 'globalThis', probe)((s) => (s === 'react' ? React : (() => { throw new Error(s) })()), window, document, globalThis)
-  return registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })())).__test
+  // 假 primitives：设置页的开关已改用官方 Switch，测试桩必须能解析它。
+  const SwitchStub = function Switch(props) { return { type: 'Switch', props: props ?? {} } }
+  const stubRequire = (s) => {
+    if (s === 'react') return React
+    if (s === '@deepseek-ai/dsh-client-ui-primitives') return { Switch: SwitchStub }
+    throw new Error(s)
+  }
+  new Function('require', 'window', 'document', 'globalThis', probe)(stubRequire, window, document, globalThis)
+  return registration.factory(stubRequire).__test
 }
 
 /* ─────────────── 有状态渲染桩：用来断言表单交互 ───────────────
@@ -312,13 +340,13 @@ test('client 对官方包的 require 必须被 try/catch 包住（取不到也�
 test('官方图标包取不到时，三个图标回退到内联 SVG（不抛错）', () => {
   // load() 的 require 桩对非 react 一律抛错，正好模拟「官方包不存在」。
   const { registration } = load()
-  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+  const plugin = registration.factory(factoryRequire)
   assert.equal(typeof plugin.apply, 'function', '官方包取不到时 factory 仍应返回可用 plugin')
 })
 
 test('factory 能跑完并返回可用 plugin（不再因顶层解构抛错）', () => {
   const { registration } = load()
-  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+  const plugin = registration.factory(factoryRequire)
   assert.equal(typeof plugin.apply, 'function')
   assert.equal(plugin.name, 'companion-client')
   assert.deepEqual(plugin.inject, ['slots'])
@@ -326,7 +354,7 @@ test('factory 能跑完并返回可用 plugin（不再因顶层解构抛错）',
 
 test('apply 会注入样式，并注册 settings.section 槽位', () => {
   const { registration, injected } = load()
-  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+  const plugin = registration.factory(factoryRequire)
 
   const registered = []
   const injectedSlots = []
@@ -358,7 +386,7 @@ test('apply 会把自己 id 的伙伴下拉挂到 conversation.input.left（不�
    * 一旦有人把它改成官方已有的 id，就成了"替换官方控件"，必须被挡下。
    */
   const { registration, injected } = load()
-  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+  const plugin = registration.factory(factoryRequire)
 
   const registered = []
   const injectedSlots = []
@@ -381,7 +409,7 @@ test('conversation.input.left 不存在时不抛错，其余功能照常', () =>
    * 设置页照常可用，不能因为下拉挂不上就把整个 client 带崩。
    */
   const { registration, injected } = load()
-  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+  const plugin = registration.factory(factoryRequire)
 
   const registered = []
   const slots = {
@@ -397,7 +425,7 @@ test('conversation.input.left 不存在时不抛错，其余功能照常', () =>
 
 test('apply 在 ctx.get("slots") 形态下同样工作，且在缺失时不抛错', () => {
   const { registration, injected } = load()
-  const plugin = registration.factory((s) => (s === 'react' ? React : (() => { throw new Error(s) })()))
+  const plugin = registration.factory(factoryRequire)
   const slots = { inject: (n, cb) => cb(), register: () => ({}) }
   plugin.apply({ get: () => slots })
   assert.equal(injected.length, 1)

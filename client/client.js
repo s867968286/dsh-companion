@@ -2,7 +2,9 @@
  * dsh-companion 的 Client 半：在官方设置页里注册一个「伙伴设置」页面。
  *
  * - 只用一个官方 slot：`settings.section`（一个注册 = 一个设置页，导航行由官方渲染）；
- * - 不引任何 UI 组件库：React.createElement + 原生 input/textarea/button；
+ * - 开关用官方 primitives 的 `Switch`：本插件早期自绘过一个（当时官方还没有这个
+ *   组件），现在官方有了，自绘那份的圆角/配色/焦点环会和「通用设置」对不上；
+ * - 其余控件仍是 React.createElement + 原生 input/textarea/button；
  * - 数据全部走 Host 半的 `/companion/api/*`（同源 fetch）。
  */
 window.__ModuleLoader__.load({
@@ -10,9 +12,22 @@ window.__ModuleLoader__.load({
   factory(require) {
     const React = require('react')
     const h = React.createElement
-    // 不 require 任何官方 UI 包：`@deepseek-ai/dsh-client-ui-primitives` 在当前 DSH
-    // 版本已不存在，顶层解构会抛错，导致 factory 失败 → apply 从不执行 → 整页裸样式。
-    // 组件与图标都在下方自建（Dialog / Icon*），只依赖 react。
+    /*
+     * 设置页的开关用官方 primitives 的 Switch。本插件早期自绘过一个（当时官方
+     * 还没有这个组件），自绘那份的 border-radius:10px 在 20px 高的控件上不是
+     * 胶囊形，和「通用设置」并排能看出差别。
+     *
+     * 必须包在 try/catch 里：该包曾经在某版本里缺失，顶层 require 一抛错，
+     * factory 就整个失败、apply 从不执行，设置页退化成裸 HTML。取不到时
+     * Switch 为 undefined，设置页会渲染一行说明，其余功能不受影响。
+     */
+    let Switch = null
+    try {
+      const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+      Switch = primitives?.Switch ?? null
+    } catch {
+      Switch = null
+    }
     const API = '/companion/api'
     const SECTION_ID = 'companion'
     /*
@@ -76,10 +91,14 @@ window.__ModuleLoader__.load({
       '.cmd-ok{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
       '.cmd-field{display:flex;flex-direction:column;gap:6px}',
       '.cmd-field-label{color:var(--dsw-alias-label-secondary,#6b6b6b);font-size:12px;font-weight:500}',
-      '.cmd-set-row{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;min-width:0;min-height:52px;padding:8px 0;border-top:1px solid var(--dsw-alias-border-l2,#e5e5e5);color:var(--dsw-alias-label-primary,#1f1f1f);font-size:13px;line-height:1.5}',
-      '.cmd-set-label{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
-      '.cmd-set-label b{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:21px}',
-      '.cmd-set-label span{font-size:11px;color:var(--dsw-alias-label-tertiary,#8c8c8c);line-height:17px}',
+      // 参数行：逐项对齐官方「通用设置」的 DeveloperToolsRow ——
+      //   行     padding 16px 0 + .5px 底边分隔线
+      //   标题   14px / 不加粗（600 只留给分组标题）
+      //   说明   12px / label-secondary / margin-top 4px
+      '.cmd-set-row{display:flex;justify-content:space-between;align-items:center;gap:24px;min-width:0;padding:16px 0;border-bottom:.5px solid var(--dsw-alias-border-l2,#e5e5e5);color:var(--dsw-alias-label-primary,#1f1f1f);font-size:13px;line-height:1.5}',
+      '.cmd-set-label{flex:1;min-width:0;display:flex;flex-direction:column}',
+      '.cmd-set-label b{font-size:14px;font-weight:400;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:20px}',
+      '.cmd-set-label span{font-size:12px;font-weight:400;margin-top:4px;color:var(--dsw-alias-label-secondary,#6b6b6b);line-height:18px}',
       '.cmd-perm{display:flex;flex-direction:column}',
       '.cmd-perm>.cmd-set-row{padding:10px 0 8px}',
       '.cmd-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:0 0 14px;max-width:420px}',
@@ -90,12 +109,6 @@ window.__ModuleLoader__.load({
       '.cmd-fields-single{grid-template-columns:minmax(0,1fr);max-width:260px;padding-bottom:6px}',
       // 平铺项（注入预算）与开关标题同级：同字号、同字重、同主色，别再比大类小一号。
       '.cmd-fields-lg label{font-size:14px;font-weight:500;color:var(--dsw-alias-label-primary,#1f1f1f);line-height:21px}',
-      '.cmd-switch{box-sizing:border-box;background:var(--dsw-alias-border-l3,#b8b8b8);cursor:pointer;border:0;border-radius:10px;flex:none;width:36px;height:20px;padding:2px;position:relative;transition:background-color .14s}',
-      '.cmd-switch-on{background:var(--dsw-alias-brand-primary,#4a7dff)}',
-      '.cmd-switch:disabled{cursor:default;opacity:.5}',
-      '.cmd-switch:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#4a7dff);outline-offset:2px}',
-      '.cmd-thumb{background:var(--dsw-alias-label-primary-foreground,#fff);border-radius:50%;width:16px;height:16px;transition:transform .12s;display:block}',
-      '.cmd-switch-on .cmd-thumb{transform:translate(16px)}',
       /*
        * 输入框工具栏里的伙伴下拉 trigger —— 逐条对齐官方权限下拉的
        * PermissionSelect trigger 样式（dsh-client-ui-permission-presets 打包内联的
@@ -416,14 +429,17 @@ window.__ModuleLoader__.load({
         form.contextBudget !== String(saved.contextBudget ?? '') ||
         form.budgetNotice !== saved.budgetNotice
 
-      const toggle = (key) => h('button', {
-        type: 'button',
-        role: 'switch',
-        'aria-checked': Boolean(form[key]),
-        'aria-label': key,
-        className: 'cmd-switch' + (form[key] ? ' cmd-switch-on' : ''),
-        onClick: () => patch({ [key]: !form[key] }),
-      }, h('span', { className: 'cmd-thumb' }))
+      // 官方 Switch：圆角、开/关配色、焦点环、disabled 透明度都由它自己负责，
+      // 与「通用设置」里的开关是同一个组件。本插件早期自绘过一个（当时官方
+      // 还没有这个组件），自绘那份的 border-radius:10px 在 20px 高的控件上
+      // 不是胶囊形，和官方放在一起能看出差别。
+      const toggle = (key, label) => (Switch === null
+        ? h('span', { className: 'cmd-set-unavailable' }, String(Boolean(form[key])))
+        : h(Switch, {
+          checked: Boolean(form[key]),
+          label: label ?? key,
+          onChange: (next) => patch({ [key]: next }),
+        }))
 
       /**
        * 数字参数：标签在上、输入在下。
@@ -485,7 +501,7 @@ window.__ModuleLoader__.load({
         h('span', { className: 'cmd-set-label' },
           h('b', null, title),
           desc ? h('span', null, desc) : null),
-        toggle(key))
+        toggle(key, title))
 
       // 后端还没返回预算字段时（旧进程）不显示 NaN，只留比例说明。
       // 这段并入「超限提醒」开关的说明里，不单独占一行——否则会把开关行的右端挤出对齐。
